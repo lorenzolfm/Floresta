@@ -188,6 +188,9 @@ class BaseRPC(ABC):
         resp = self.noraise_request(method, params)
 
         if resp["status_code"] != 200:
+            self.log.error(
+                f"RPC request failed with status code {resp['status_code']}: {resp['body']}"
+            )
             raise HTTPError
 
         result = resp["body"]
@@ -409,6 +412,16 @@ class BaseRPC(ABC):
         Get address manager statistics broken down by network
         """
         return self.perform_request("getaddrmaninfo")
+
+    def get_raw_transaction(self, txid: str, verbose: int | None = None):
+        """
+        Returns the raw transaction data for a given transaction ID.
+        """
+        params = [txid]
+        if verbose is not None:
+            params.append(int(verbose))
+
+        return self.perform_request("getrawtransaction", params=params)
 
     def ensure_rpc_raw_request_call_success(
         self, payload, content_type="application/json"
