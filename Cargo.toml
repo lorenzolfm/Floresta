@@ -83,3 +83,6 @@ metrics = { path = "metrics" }
 
 [workspace.lints.clippy]
 unused_async = "deny"
+
+[profile.release]
+overflow-checks = true
