@@ -745,7 +745,7 @@ pub(super) mod peer_utils {
     use bitcoin::p2p::message_network::VersionMessage;
     use bitcoin::p2p::Address;
     use bitcoin::p2p::ServiceFlags;
-    use floresta_common::service_flags;
+    use floresta_common::advertised_services;
     use rand::thread_rng;
     use rand::Rng;
 
@@ -767,11 +767,12 @@ pub(super) mod peer_utils {
         best_block: u32,
         peer_address: &LocalAddress,
     ) -> NetworkMessage {
-        // Services supported by this node.
-        //   - WITNESS: this implementation supports SegWit blocks and transactions.
-        //   - P2P_V2: this implementation supports P2PV2 (BIP-0324) connections.
-        //   - UTREEXO: this implementation supports Utreexo P2P (BIP-0183) messages.
-        let services = ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into();
+        // Services supported by this node. The list of advertised flags lives in
+        // `floresta_common::advertised_services` so that this handshake and the
+        // `getnetworkinfo` RPC stay in lockstep.
+        let services = advertised_services()
+            .into_iter()
+            .fold(ServiceFlags::NONE, |acc, (f, _)| acc | f);
 
         // The current UNIX timestamp.
         let timestamp = SystemTime::now()

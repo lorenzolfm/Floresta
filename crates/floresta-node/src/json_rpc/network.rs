@@ -5,7 +5,13 @@
 use core::net::IpAddr;
 use core::net::SocketAddr;
 
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::Network;
+use corepc_types::v30::GetNetworkInfo;
+use corepc_types::v30::GetNetworkInfoNetwork;
+use floresta_common::advertised_services;
+use floresta_wire::address_man::ReachableNetworks;
+use floresta_wire::address_man::SUPPORTED_NETWORKS;
 use floresta_wire::node_interface::PeerInfo;
 use serde_json::json;
 use serde_json::Value;
@@ -15,6 +21,37 @@ use super::server::RpcChain;
 use super::server::RpcImpl;
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
+
+/// Floresta's P2P protocol version, mirrored from
+/// `floresta_wire::p2p_wire::peer::peer_utils::PROTOCOL_VERSION`
+const PROTOCOL_VERSION: usize = 70016;
+
+/// Encode a `CARGO_PKG_VERSION` string (`"<major>.<minor>.<patch>"`) as Bitcoin Core's
+/// numeric `MMmmpp` version. Returns `0` for malformed input.
+fn parse_mmmmpp(version: &str) -> usize {
+    let mut parts = version.splitn(3, '.').map(|p| p.parse::<usize>().ok());
+
+    let major = parts.next().flatten().unwrap_or(0);
+    let minor = parts.next().flatten().unwrap_or(0);
+
+    let patch = parts
+        .next()
+        .flatten()
+        .or_else(|| {
+            version
+                .split('.')
+                .nth(2)
+                .map(|p| {
+                    p.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                })
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(0);
+
+    major * 10_000 + minor * 100 + patch
+}
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub(crate) async fn ping(&self) -> Result<bool> {
@@ -124,5 +161,86 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .get_connection_count()
             .await
             .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))
+    }
+
+    pub(crate) async fn get_network_info(&self) -> Result<GetNetworkInfo> {
+        // Floresta does not listen for inbound connections, so every peer is outbound.
+        let connections_in = 0;
+        let connections_out = self
+            .node
+            .get_connection_count()
+            .await
+            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))?;
+
+        let advertised = advertised_services();
+
+        let services = advertised
+            .iter()
+            .fold(ServiceFlags::NONE, |acc, (f, _)| acc | *f);
+
+        let local_services = format!("{:016x}", services.to_u64());
+        let local_services_names: Vec<String> =
+            advertised.iter().map(|(_, n)| (*n).to_string()).collect();
+
+        let proxy_str = self.proxy.map(|addr| addr.to_string()).unwrap_or_default();
+        let proxy_set = self.proxy.is_some();
+
+        let networks = [
+            ReachableNetworks::IPv4,
+            ReachableNetworks::IPv6,
+            ReachableNetworks::TorV3,
+            ReachableNetworks::I2P,
+            ReachableNetworks::Cjdns,
+        ]
+        .into_iter()
+        .map(|net| GetNetworkInfoNetwork {
+            name: match net {
+                ReachableNetworks::IPv4 => "ipv4",
+                ReachableNetworks::IPv6 => "ipv6",
+                ReachableNetworks::TorV3 => "onion",
+                ReachableNetworks::I2P => "i2p",
+                ReachableNetworks::Cjdns => "cjdns",
+            }
+            .to_string(),
+            limited: false,
+            reachable: SUPPORTED_NETWORKS.contains(&net),
+            proxy: proxy_str.clone(),
+            proxy_randomize_credentials: proxy_set,
+        })
+        .collect();
+
+        let version = parse_mmmmpp(env!("CARGO_PKG_VERSION"));
+
+        Ok(GetNetworkInfo {
+            version,
+            subversion: self.user_agent.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            local_services,
+            local_services_names,
+            local_relay: false,
+            time_offset: 0,
+            connections: connections_in + connections_out,
+            connections_in,
+            connections_out,
+            network_active: true,
+            networks,
+            relay_fee: 0.0,
+            incremental_fee: 0.0,
+            local_addresses: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mmmmpp;
+
+    #[test]
+    fn parse_mmmmpp_encodes_semver_correctly() {
+        assert_eq!(parse_mmmmpp("0.9.0-rc1"), 900);
+        assert_eq!(parse_mmmmpp("23.1.5"), 230_105);
+        assert_eq!(parse_mmmmpp("1.2"), 10_200);
+        assert_eq!(parse_mmmmpp("1"), 10_000);
     }
 }

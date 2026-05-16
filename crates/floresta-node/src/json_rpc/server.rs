@@ -81,6 +81,8 @@ pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) inflight: Arc<RwLock<HashMap<Value, InflightRpc>>>,
     pub(super) log_path: String,
     pub(super) start_time: Instant,
+    pub(super) user_agent: String,
+    pub(super) proxy: Option<SocketAddr>,
 }
 
 type Result<T> = std::result::Result<T, JsonRpcError>;
@@ -339,6 +341,11 @@ async fn handle_json_rpc_request(
 
         "getconnectioncount" => state
             .get_connection_count()
+            .await
+            .map(|v| serde_json::to_value(v).unwrap()),
+
+        "getnetworkinfo" => state
+            .get_network_info()
             .await
             .map(|v| serde_json::to_value(v).unwrap()),
 
@@ -730,6 +737,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
         address: Option<SocketAddr>,
         log_path: String,
+        user_agent: String,
+        proxy: Option<SocketAddr>,
     ) {
         let address = address.unwrap_or_else(|| {
             format!("127.0.0.1:{}", Self::get_port(&network))
@@ -770,6 +779,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 inflight: Arc::new(RwLock::new(HashMap::new())),
                 log_path,
                 start_time: Instant::now(),
+                user_agent,
+                proxy,
             }));
 
         axum::serve(listener, router)

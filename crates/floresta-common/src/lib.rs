@@ -82,6 +82,23 @@ pub mod service_flags {
     pub const UTREEXO_ARCHIVE: u64 = 1 << 13;
 }
 
+/// P2P service flags Floresta advertises, paired with their human-readable
+/// names.
+///
+///   - WITNESS: SegWit blocks and transactions.
+///   - P2P_V2: BIP-324 encrypted transport.
+///   - UTREEXO: Utreexo P2P inclusion proofs (BIP-0183).
+pub fn advertised_services() -> [(bitcoin::p2p::ServiceFlags, &'static str); 3] {
+    [
+        (bitcoin::p2p::ServiceFlags::WITNESS, "WITNESS"),
+        (bitcoin::p2p::ServiceFlags::P2P_V2, "P2P_V2"),
+        (
+            bitcoin::p2p::ServiceFlags::from(service_flags::UTREEXO),
+            "UTREEXO",
+        ),
+    ]
+}
+
 #[cfg(not(feature = "std"))]
 pub mod prelude {
     extern crate alloc;
