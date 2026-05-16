@@ -300,6 +300,12 @@ class BaseRPC(ABC):
         """
         return self.perform_request("getconnectioncount")
 
+    def get_networkinfo(self):
+        """
+        Get general state info regarding P2P networking
+        """
+        return self.perform_request("getnetworkinfo")
+
     def get_rpcinfo(self):
         """
         Returns stats about our RPC server
