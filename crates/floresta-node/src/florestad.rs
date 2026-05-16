@@ -36,7 +36,7 @@ use floresta_watch_only::kv_database::KvDatabase;
 use floresta_watch_only::AddressCache;
 use floresta_watch_only::WatchOnlyError;
 use floresta_wire::address_man::AddressMan;
-use floresta_wire::address_man::SUPPORTED_NETWORKS;
+use floresta_wire::address_man::ReachableNetworks;
 use floresta_wire::node::running_ctx::RunningNode;
 use floresta_wire::node::UtreexoNode;
 use floresta_wire::UtreexoNodeConfig;
@@ -434,7 +434,7 @@ impl Florestad {
             ))),
             cfilters.clone(),
             kill_signal.clone(),
-            AddressMan::new(None, SUPPORTED_NETWORKS),
+            AddressMan::new(None, &ReachableNetworks::SUPPORTED),
         )
         .map_err(|e| FlorestadError::CouldNotCreateChainProvider(format!("{e}")))?;
 

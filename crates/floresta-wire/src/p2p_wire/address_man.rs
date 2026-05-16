@@ -48,10 +48,6 @@ const ASSUME_STALE: u64 = 24 * 60 * 60; // 24 hours
 /// How many addresses we keep in our address manager
 const MAX_ADDRESSES: usize = 50_000;
 
-/// The [`ReachableNetworks`] this implementation currently supports.
-pub const SUPPORTED_NETWORKS: &[ReachableNetworks] =
-    &[ReachableNetworks::IPv4, ReachableNetworks::IPv6];
-
 /// A type alias for a list of addresses to send to our peers
 type AddressToSend = Vec<(AddrV2, u64, ServiceFlags, u16)>;
 
@@ -86,6 +82,26 @@ pub enum ReachableNetworks {
     TorV3,
     I2P,
     Cjdns,
+}
+
+impl ReachableNetworks {
+    /// All networks Floresta is aware of.
+    pub const ALL: [Self; 5] = [Self::IPv4, Self::IPv6, Self::TorV3, Self::I2P, Self::Cjdns];
+
+    /// Networks this implementation currently supports.
+    pub const SUPPORTED: [Self; 2] = [Self::IPv4, Self::IPv6];
+}
+
+impl core::fmt::Display for ReachableNetworks {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReachableNetworks::IPv4 => write!(f, "ipv4"),
+            ReachableNetworks::IPv6 => write!(f, "ipv6"),
+            ReachableNetworks::TorV3 => write!(f, "onion"),
+            ReachableNetworks::I2P => write!(f, "i2p"),
+            ReachableNetworks::Cjdns => write!(f, "cjdns"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1228,7 +1244,7 @@ mod test {
     use crate::address_man::AddressMan;
     use crate::address_man::DiskLocalAddress;
     use crate::address_man::ReachableNetworks;
-    use crate::address_man::SUPPORTED_NETWORKS;
+    use crate::address_man::ReachableNetworks;
 
     fn load_addresses_from_json(file_path: &str) -> io::Result<Vec<LocalAddress>> {
         let mut contents = String::new();
@@ -1687,7 +1703,7 @@ mod test {
 
     #[test]
     fn test_add_fixed_addresses() {
-        let mut address_man = AddressMan::new(None, SUPPORTED_NETWORKS);
+        let mut address_man = AddressMan::new(None, &ReachableNetworks::SUPPORTED);
         address_man.add_fixed_addresses(Network::Signet);
         assert!(!address_man.addresses.is_empty());
     }

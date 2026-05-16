@@ -965,7 +965,7 @@ mod test {
     use floresta_watch_only::merkle::MerkleProof;
     use floresta_watch_only::AddressCache;
     use floresta_wire::address_man::AddressMan;
-    use floresta_wire::address_man::SUPPORTED_NETWORKS;
+    use floresta_wire::address_man::ReachableNetworks;
     use floresta_wire::node::running_ctx::RunningNode;
     use floresta_wire::node::UtreexoNode;
     use floresta_wire::UtreexoNodeConfig;
@@ -1113,7 +1113,7 @@ mod test {
                 Arc::new(Mutex::new(Mempool::new(MEMPOOL_SIZE))),
                 None,
                 Arc::new(RwLock::new(false)),
-                AddressMan::new(None, SUPPORTED_NETWORKS),
+                AddressMan::new(None, &ReachableNetworks::SUPPORTED),
             )
             .unwrap();
 
