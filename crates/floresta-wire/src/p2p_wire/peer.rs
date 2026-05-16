@@ -20,6 +20,7 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::PROTOCOL_VERSION;
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::Transaction;
@@ -719,7 +720,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         self.blocks_only = !version.relay;
         self.current_best_block = version.start_height;
         self.services = version.services;
-        if version.version >= 70016 {
+        if version.version >= PROTOCOL_VERSION {
             self.write(NetworkMessage::SendAddrV2).await?;
         }
         self.state = State::SentVerack;
@@ -744,15 +745,12 @@ pub(super) mod peer_utils {
     use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::p2p::message_network::VersionMessage;
     use bitcoin::p2p::Address;
-    use bitcoin::p2p::ServiceFlags;
-    use floresta_common::service_flags;
+    use floresta_common::advertised_services;
+    use floresta_common::PROTOCOL_VERSION;
     use rand::thread_rng;
     use rand::Rng;
 
     use crate::address_man::LocalAddress;
-
-    /// The protocol version this implementation speaks.
-    pub const PROTOCOL_VERSION: u32 = 70016;
 
     /// Build the [pong](NetworkMessage::Pong) message, which must be sent whenever a peer sends us a
     /// [ping](NetworkMessage::Ping). Note that the nonce received in the ping must be reused in the pong.
@@ -767,11 +765,8 @@ pub(super) mod peer_utils {
         best_block: u32,
         peer_address: &LocalAddress,
     ) -> NetworkMessage {
-        // Services supported by this node.
-        //   - WITNESS: this implementation supports SegWit blocks and transactions.
-        //   - P2P_V2: this implementation supports P2PV2 (BIP-0324) connections.
-        //   - UTREEXO: this implementation supports Utreexo P2P (BIP-0183) messages.
-        let services = ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | service_flags::UTREEXO.into();
+        // The set of services supported by this node.
+        let services = advertised_services();
 
         // The current UNIX timestamp.
         let timestamp = SystemTime::now()

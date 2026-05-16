@@ -12,10 +12,15 @@
 )]
 #![no_std]
 
+extern crate alloc;
+
+use alloc::string::ToString;
+
 use bitcoin::consensus::encode;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::ScriptBuf;
 use bitcoin::VarInt;
 use sha2::Digest;
@@ -80,6 +85,39 @@ pub mod service_flags {
     /// `UTREEXO_ARCHIVE`: the node is capable of serving historical
     /// inclusion proofs for all blocks, but not necessarily historical blocks.
     pub const UTREEXO_ARCHIVE: u64 = 1 << 13;
+}
+
+/// The P2P protocol version Floresta speaks.
+pub const PROTOCOL_VERSION: u32 = 70016;
+
+/// The services advertised by this node.
+///
+///   - `WITNESS`: SegWit blocks and transactions (BIP-0144).
+///   - `P2P_V2`: Encrypted transport (BIP-0324).
+///   - `UTREEXO`: Utreexo inclusion proofs (BIP-0183).
+pub fn advertised_services() -> ServiceFlags {
+    ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(service_flags::UTREEXO)
+}
+
+/// Returns string names for all known service flags that are set in `flags`.
+pub fn service_flags_strings(flags: &ServiceFlags) -> alloc::vec::Vec<alloc::string::String> {
+    let known_flags = [
+        (ServiceFlags::NETWORK, "NETWORK"),
+        (ServiceFlags::GETUTXO, "GETUTXO"),
+        (ServiceFlags::BLOOM, "BLOOM"),
+        (ServiceFlags::WITNESS, "WITNESS"),
+        (ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
+        (ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
+        (ServiceFlags::P2P_V2, "P2P_V2"),
+        (service_flags::UTREEXO.into(), "UTREEXO"),
+        (service_flags::UTREEXO_ARCHIVE.into(), "UTREEXO_ARCHIVE"),
+    ];
+
+    known_flags
+        .iter()
+        .filter(|(flag, _)| flags.has(*flag))
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 #[cfg(not(feature = "std"))]
