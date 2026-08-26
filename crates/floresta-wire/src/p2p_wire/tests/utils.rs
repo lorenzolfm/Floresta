@@ -300,13 +300,24 @@ pub struct PeerData {
     accs: HashMap<BlockHash, Vec<u8>>,
 }
 
-pub async fn setup_node(
+/// A node wired up to simulated peers, together with the chain it validates against.
+type TestNode = (
+    UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+    Arc<ChainState<FlatChainStore>>,
+);
+
+/// Builds a node and its simulated peers without running the event loop.
+///
+/// [`setup_node`] runs the node to completion, which is what the end-to-end sync tests want.
+/// Tests that drive a single handler by hand need the node before it starts, so they can seed
+/// inflight requests first.
+pub fn build_node(
     peers: Vec<PeerData>,
     pow_fraud_proofs: bool,
     network: Network,
     datadir: impl AsRef<Path>,
     num_blocks: usize,
-) -> Arc<ChainState<FlatChainStore>> {
+) -> TestNode {
     let config = FlatChainStoreConfig::new(&datadir);
 
     let chainstore = FlatChainStore::new(config).unwrap();
@@ -372,11 +383,43 @@ pub async fn setup_node(
         );
     }
 
+    (node, chain)
+}
+
+pub async fn setup_node(
+    peers: Vec<PeerData>,
+    pow_fraud_proofs: bool,
+    network: Network,
+    datadir: impl AsRef<Path>,
+    num_blocks: usize,
+) -> Arc<ChainState<FlatChainStore>> {
+    let (node, chain) = build_node(peers, pow_fraud_proofs, network, datadir, num_blocks);
+
     timeout(Duration::from_secs(100), node.run(|_| {}))
         .await
         .unwrap();
 
     chain
+}
+
+/// Marks a peer as having completed the handshake, which `node.run()` would otherwise do when it
+/// processes the peer's `Ready` message.
+///
+/// Sets the advertised services and seeds the message-time EMA. `choose_peer_by_latency` needs
+/// both: it only considers `Ready` peers that have a latency sample.
+pub fn mark_peer_ready(
+    node: &mut UtreexoNode<Arc<ChainState<FlatChainStore>>, SyncNode>,
+    peer: u32,
+) {
+    let peer = node.peers.get_mut(&peer).expect("peer was inserted");
+
+    peer.state = PeerStatus::Ready;
+    peer.services = ServiceFlags::NETWORK
+        | ServiceFlags::WITNESS
+        | service_flags::UTREEXO.into()
+        | service_flags::UTREEXO_ARCHIVE.into()
+        | ServiceFlags::COMPACT_FILTERS;
+    peer.message_times.add(1.0);
 }
 
 #[cfg(test)]
