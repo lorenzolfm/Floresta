@@ -590,7 +590,8 @@ impl Consensus {
     ///
     /// Unlike [`Block::check_merkle_root`], this function returns the list of computed [`Txid`]s
     /// if the merkle roots matched, or `None` otherwise. It also rejects the CVE-2012-2459
-    /// malleation, which [`Block::check_merkle_root`] does not detect.
+    /// malleation, which [`Block::check_merkle_root`] does not detect in the pinned `bitcoin`
+    /// 0.32.8 (see [`Self::merkle_root_mutated`]).
     pub fn check_merkle_root(block: &Block) -> Option<Vec<Txid>> {
         let txids: Vec<_> = block.txdata.iter().map(|obj| obj.compute_txid()).collect();
         let hashes = txids.iter().map(|txid| txid.to_raw_hash()).collect();
@@ -607,10 +608,16 @@ impl Consensus {
     ///
     /// An adjacent duplicate pair means the transaction list was padded to reproduce a merkle
     /// root it does not honestly commit to (CVE-2012-2459). Bitcoin Core detects this with the
-    /// `mutated` out-param of [`ComputeMerkleRoot`]; `rust-bitcoin`'s `merkle_tree::calculate_root`
-    /// has no equivalent, so we compute the root ourselves.
+    /// `mutated` out-param of [`ComputeMerkleRoot`].
+    ///
+    /// The pinned `bitcoin` 0.32.8 has no equivalent: `merkle_tree::calculate_root` pads odd
+    /// levels by repeating the last hash and never reports it. So we compute the root ourselves.
+    /// Upstream has since fixed this ([rust-bitcoin#5116], released in `bitcoin-primitives`
+    /// 0.102.0), by returning `None` for an ambiguous tree. **Once the `bitcoin` pin moves past
+    /// 0.33, this function is redundant and should be dropped** in favour of the upstream check.
     ///
     /// [`ComputeMerkleRoot`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/consensus/merkle.cpp#L15
+    /// [rust-bitcoin#5116]: https://github.com/rust-bitcoin/rust-bitcoin/pull/5116
     fn merkle_root_mutated(mut hashes: Vec<sha256d::Hash>) -> (Option<sha256d::Hash>, bool) {
         if hashes.is_empty() {
             return (None, false);
@@ -650,11 +657,16 @@ impl Consensus {
     ///
     /// This mirrors Bitcoin Core's [`CheckWitnessMalleation`]. The ordering matters: we look for
     /// the commitment first, and only fall back to "then no transaction may carry witness data"
-    /// when there is none. [`Block::check_witness_commitment`] does the opposite and returns
+    /// when there is none.
+    ///
+    /// The pinned `bitcoin` 0.32.8 does the opposite: [`Block::check_witness_commitment`] returns
     /// `true` as soon as every witness is empty, which lets a witness-stripped block pass even
-    /// though its coinbase still commits to witness data.
+    /// though its coinbase still commits to witness data. Upstream has since reordered it the
+    /// same way we do here ([rust-bitcoin#6250], unreleased as of `bitcoin-primitives` 0.102.0).
+    /// **Once the `bitcoin` pin includes that fix, this function is redundant.**
     ///
     /// [`CheckWitnessMalleation`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L3889
+    /// [rust-bitcoin#6250]: https://github.com/rust-bitcoin/rust-bitcoin/pull/6250
     fn is_witness_malleated(block: &Block) -> bool {
         let Some(coinbase) = block.txdata.first() else {
             return true;
@@ -1538,7 +1550,9 @@ mod tests {
         // The whole point of this malleation: the header, and so the block hash, is untouched
         assert_eq!(mutated.block_hash(), honest.block_hash());
         assert_eq!(mutated.compute_merkle_root(), honest.compute_merkle_root());
-        // `rust-bitcoin` does not catch this one, which is why we compute the root ourselves
+        // The pinned 0.32.8 does not catch this, which is why we compute the root ourselves.
+        // This assertion fails once the pin picks up rust-bitcoin#5116, which is the signal that
+        // `merkle_root_mutated` can go.
         assert!(mutated.check_merkle_root());
 
         assert!(Consensus::is_block_mutated(&mutated));
@@ -1553,7 +1567,9 @@ mod tests {
 
         // Stripping witnesses leaves every txid, and therefore the block hash, unchanged
         assert_eq!(mutated.block_hash(), honest.block_hash());
-        // `rust-bitcoin` returns early here and calls the block committed, which is the gap
+        // The pinned 0.32.8 returns early here and calls the block committed, which is the gap.
+        // This assertion fails once the pin picks up rust-bitcoin#6250, which is the signal that
+        // `is_witness_malleated` can go.
         assert!(mutated.check_witness_commitment());
 
         assert!(Consensus::is_block_mutated(&mutated));
