@@ -59,12 +59,17 @@ where
 {
     // === SENDING TO PEERS ===
 
-    /// Picks a `Ready` peer supporting `service`, biased toward lower message latency.
+    /// Picks a `Ready` peer supporting `service`, biased toward lower message latency,
+    /// optionally skipping the peer in `except`.
     ///
     /// Each candidate weight is computed as `lowest_time / time_i`. For instance, if we have two
     /// candidates with latencies of 50ms and 100ms, weights are 1.0 and 0.5 respectively, and the
     /// probability of being chosen is 2/3 and 1/3.
-    fn choose_peer_by_latency(&self, service: ServiceFlags) -> Option<(&PeerId, &LocalPeerView)> {
+    fn choose_peer_by_latency(
+        &self,
+        service: ServiceFlags,
+        except: Option<PeerId>,
+    ) -> Option<(&PeerId, &LocalPeerView)> {
         // Epsilon is a small positive floor for `f64`. If by any chance a peer has extremely low
         // message latency, we clamp it to `EPS` so `lowest_time / time_i` stays finite and stable.
         const EPS: f64 = 1e-9;
@@ -72,6 +77,7 @@ where
         let candidates: Vec<(&PeerId, &LocalPeerView, f64)> = self
             .peers
             .iter()
+            .filter(|(id, _)| Some(**id) != except)
             .filter(|(_, peer)| peer.services.has(service) && peer.state == PeerStatus::Ready)
             .filter_map(|(id, peer)| {
                 // Get the average message latency from each peer
@@ -126,8 +132,22 @@ where
         request: NodeRequest,
         required_service: ServiceFlags,
     ) -> Result<PeerId, WireError> {
+        self.send_to_fast_peer_except(request, required_service, None)
+    }
+
+    /// Like [`Self::send_to_fast_peer`], but never picks the peer in `except`.
+    ///
+    /// Use this when retrying a request that the excluded peer already answered badly. Banning
+    /// alone is not enough to keep it out of the candidate set: manual peers are exempt from
+    /// bans, so without this they can be handed the very request they just failed.
+    pub(crate) fn send_to_fast_peer_except(
+        &self,
+        request: NodeRequest,
+        required_service: ServiceFlags,
+        except: Option<PeerId>,
+    ) -> Result<PeerId, WireError> {
         let (peer_id, peer) = self
-            .choose_peer_by_latency(required_service)
+            .choose_peer_by_latency(required_service, except)
             .ok_or(WireError::NoPeersAvailable)?;
 
         peer.channel.send(request)?;

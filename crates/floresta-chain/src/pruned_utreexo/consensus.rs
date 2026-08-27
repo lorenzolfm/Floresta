@@ -25,8 +25,9 @@ use bitcoin::blockdata::Weight;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::HashEngine;
 use bitcoin::hashes::sha256;
-use bitcoin::merkle_tree;
+use bitcoin::hashes::sha256d;
 use bitcoin::script;
 #[cfg(feature = "bitcoinkernel")]
 use bitcoinkernel::PrecomputedTransactionData;
@@ -51,6 +52,10 @@ const MAX_SUBSIDY_HALVINGS: u32 = u64::BITS;
 
 /// Maximum script length in bytes, as defined [in Bitcoin Core](https://github.com/bitcoin/bitcoin/blob/v30.0/src/script/script.h#L40).
 const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// The prefix of the coinbase output that carries the witness commitment: `OP_RETURN`, a 36-byte
+/// push, then the four-byte `aa21a9ed` tag defined by BIP-141.
+const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
 /// The version tag to be prepended to the leafhash. It's just the sha512 hash of the string
 /// `UtreexoV1` represented as a vector of [u8] ([85 116 114 101 101 120 111 86 49]).
@@ -569,7 +574,8 @@ impl Consensus {
             Err(BlockValidationErrors::BadBip34)?;
         }
 
-        if !block.check_witness_commitment() {
+        let segwit_active = height >= self.parameters.segwit_activation_height;
+        if Self::is_witness_malleated(block, segwit_active) {
             Err(BlockValidationErrors::BadWitnessCommitment)?;
         }
 
@@ -580,23 +586,184 @@ impl Consensus {
         Ok(txids)
     }
 
-    /// Checks if the merkle root of the header matches the merkle root of the transaction list.
+    /// Checks if the merkle root of the header matches the merkle root of the transaction list,
+    /// and that the merkle tree itself was not padded to fake that root.
     ///
     /// Unlike [`Block::check_merkle_root`], this function returns the list of computed [`Txid`]s
-    /// if the merkle roots matched, or `None` otherwise.
-    ///
-    /// The merkle root is computed in the same way as [`Block::compute_merkle_root`].
+    /// if the merkle roots matched, or `None` otherwise. It also rejects the CVE-2012-2459
+    /// malleation, which [`Block::check_merkle_root`] does not detect in the pinned `bitcoin`
+    /// 0.32.8 (see [`Self::merkle_root_mutated`]).
     pub fn check_merkle_root(block: &Block) -> Option<Vec<Txid>> {
         let txids: Vec<_> = block.txdata.iter().map(|obj| obj.compute_txid()).collect();
+        let hashes = txids.iter().map(|txid| txid.to_raw_hash()).collect();
 
-        // Copy the hashes into an iterator, as `calculate_root` requires ownership
-        let hashes_iter = txids.iter().copied().map(|txid| txid.to_raw_hash());
-
-        let calculated = merkle_tree::calculate_root(hashes_iter).map(|h| h.into());
-        match calculated {
-            Some(merkle_root) if block.header.merkle_root == merkle_root => Some(txids),
+        match Self::merkle_root_mutated(hashes) {
+            // A padded tree reproduces a root the transaction list doesn't honestly commit to
+            (Some(root), false) if block.header.merkle_root.to_raw_hash() == root => Some(txids),
             _ => None,
         }
+    }
+
+    /// Computes a merkle root, and reports whether any level held an adjacent pair of equal
+    /// hashes.
+    ///
+    /// An adjacent duplicate pair means the transaction list was padded to reproduce a merkle
+    /// root it does not honestly commit to (CVE-2012-2459). Bitcoin Core detects this with the
+    /// `mutated` out-param of [`ComputeMerkleRoot`].
+    ///
+    /// The pinned `bitcoin` 0.32.8 has no equivalent: `merkle_tree::calculate_root` pads odd
+    /// levels by repeating the last hash and never reports it. So we compute the root ourselves.
+    /// Upstream has since fixed this ([rust-bitcoin#5116], released in `bitcoin-primitives`
+    /// 0.102.0), by returning `None` for an ambiguous tree. **Once the `bitcoin` pin moves past
+    /// 0.33, this function is redundant and should be dropped** in favour of the upstream check.
+    ///
+    /// [`ComputeMerkleRoot`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/consensus/merkle.cpp#L46
+    /// [rust-bitcoin#5116]: https://github.com/rust-bitcoin/rust-bitcoin/pull/5116
+    fn merkle_root_mutated(mut hashes: Vec<sha256d::Hash>) -> (Option<sha256d::Hash>, bool) {
+        if hashes.is_empty() {
+            return (None, false);
+        }
+
+        let mut mutated = false;
+        while hashes.len() > 1 {
+            // Every level is checked, since equal pairs can appear above the leaves. The pairs
+            // are compared *before* padding, so the padding we add here is never miscounted as
+            // a mutation.
+            for pair in hashes.chunks_exact(2) {
+                if pair[0] == pair[1] {
+                    mutated = true;
+                }
+            }
+
+            if hashes.len() % 2 == 1 {
+                let last = *hashes.last().expect("hashes is not empty");
+                hashes.push(last);
+            }
+
+            hashes = hashes
+                .chunks_exact(2)
+                .map(|pair| {
+                    let mut engine = sha256d::Hash::engine();
+                    engine.input(pair[0].as_byte_array());
+                    engine.input(pair[1].as_byte_array());
+                    sha256d::Hash::from_engine(engine)
+                })
+                .collect();
+        }
+
+        (Some(hashes[0]), mutated)
+    }
+
+    /// Whether the block's witness data disagrees with the coinbase witness commitment.
+    ///
+    /// This mirrors Bitcoin Core's [`CheckWitnessMalleation`]. The ordering matters: we look for
+    /// the commitment first, and only fall back to "then no transaction may carry witness data"
+    /// when there is none.
+    ///
+    /// `segwit_active` gates the commitment half, exactly as Core's `expect_witness_commitment`
+    /// does. It is **not** optional: BIP-141 deploys the commitment as a soft fork, so before
+    /// activation `aa21a9ed` is an ordinary `OP_RETURN` that binds nothing. 13,245 mainnet
+    /// blocks between heights 434,499 and 481,823 carry a well-formed commitment with no
+    /// witness data at all, because pool software emitted it before the rule bound. Validating
+    /// those against the commitment rejects the real chain.
+    ///
+    /// The pinned `bitcoin` 0.32.8 does the opposite: [`Block::check_witness_commitment`] returns
+    /// `true` as soon as every witness is empty, which lets a witness-stripped block pass even
+    /// though its coinbase still commits to witness data. Upstream has since reordered it the
+    /// same way we do here ([rust-bitcoin#6250], unreleased as of `bitcoin-primitives` 0.102.0).
+    /// **Once the `bitcoin` pin includes that fix, this function is redundant.**
+    ///
+    /// [`CheckWitnessMalleation`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L3966
+    /// [rust-bitcoin#6250]: https://github.com/rust-bitcoin/rust-bitcoin/pull/6250
+    fn is_witness_malleated(block: &Block, segwit_active: bool) -> bool {
+        let Some(coinbase) = block.txdata.first() else {
+            return true;
+        };
+
+        // Before segwit activates, `aa21a9ed` is an ordinary OP_RETURN with no consensus
+        // meaning, so a commitment output binds nothing and must not be validated. Skipping
+        // the lookup leaves only the "no witness data at all" rule, which Core enforces at
+        // every height. See the note on the activation gate above.
+        let commitment = segwit_active
+            .then(|| {
+                coinbase.output.iter().rev().find_map(|out| {
+                    let spk = out.script_pubkey.as_bytes();
+                    let is_commitment = spk.len() >= 38 && spk[..6] == WITNESS_COMMITMENT_HEADER;
+
+                    is_commitment.then(|| &spk[6..38])
+                })
+            })
+            .flatten();
+
+        let Some(commitment) = commitment else {
+            // Without a commitment, no transaction may carry witness data. Otherwise a peer
+            // could append arbitrary witnesses to a block that doesn't commit to any.
+            return block
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()));
+        };
+
+        // The commitment lives in the coinbase txid, so it survives any mutation that keeps the
+        // merkle root. That makes the witness reserved value the thing an attacker has to drop.
+        let Some(input) = coinbase.input.first() else {
+            return true;
+        };
+        if input.witness.len() != 1 {
+            return true;
+        }
+        let Some(reserved) = input.witness.nth(0) else {
+            return true;
+        };
+        if reserved.len() != 32 {
+            return true;
+        }
+
+        let Some(witness_root) = block.witness_root() else {
+            return true;
+        };
+
+        // The witness tree needs no separate malleation check: it has the same shape as the txid
+        // tree, and equal wtxids imply equal txids, so `check_merkle_root` already covers it.
+        Block::compute_witness_commitment(&witness_root, reserved).as_byte_array()[..]
+            != commitment[..]
+    }
+
+    /// Whether this block was mutated: its transaction data does not match what the header
+    /// commits to, but the header — and therefore the block hash — is unchanged.
+    ///
+    /// A mutated block is **not** proof that the block is invalid. Several distinct byte strings
+    /// map to the same block hash, so a mutated block only proves that the peer which sent it is
+    /// dishonest. Callers must blame that peer alone, and must not invalidate the block: the real
+    /// block behind this hash may well be valid.
+    ///
+    /// Every check here is an existing consensus rule. This function only groups the subset whose
+    /// failure is attributable to the sender rather than to the miner, mirroring Bitcoin Core's
+    /// [`IsBlockMutated`].
+    ///
+    /// `segwit_active` says whether the block's height is at or above the segwit activation
+    /// height; it gates the commitment check in [`Self::is_witness_malleated`]. Core passes the
+    /// same flag from `DeploymentActiveAfter(prev_block, ..., DEPLOYMENT_SEGWIT)`, and skips the
+    /// mutation check altogether when it cannot resolve the previous block.
+    ///
+    /// [`IsBlockMutated`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L4126
+    pub fn is_block_mutated(block: &Block, segwit_active: bool) -> bool {
+        if Self::check_merkle_root(block).is_none() {
+            return true;
+        }
+
+        let Some(coinbase) = block.txdata.first() else {
+            return true;
+        };
+
+        if !coinbase.is_coinbase() {
+            // Such a block is already invalid, but it may be the 64-byte-transaction mutation of
+            // a valid one, so don't let the caller attribute it to the header. See section 3.1 of
+            // "Weaknesses in Bitcoin's Merkle Root Construction".
+            return block.txdata.iter().any(|tx| tx.base_size() == 64);
+        }
+
+        Self::is_witness_malleated(block, segwit_active)
     }
 
     /// Validates a block under AssumeValid SwiftSync, where previous outputs are unavailable,
@@ -1016,6 +1183,7 @@ mod tests {
     use bitcoin::TxIn;
     use bitcoin::TxOut;
     use bitcoin::Txid;
+    use bitcoin::Witness;
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::deserialize;
     use bitcoin::consensus::encode::deserialize_hex;
@@ -1321,6 +1489,243 @@ mod tests {
                 panic!("merkle roots shouldn't match");
             }
         }
+    }
+
+    /// The real segwit block used across the mutation tests: 3,352 transactions, a witness
+    /// commitment, and a coinbase witness reserved value.
+    fn segwit_block() -> Block {
+        decode_block("./testdata/block_866342/raw.zst")
+    }
+
+    /// A real pre-segwit block: no witness data and no commitment anywhere.
+    fn pre_segwit_block() -> Block {
+        decode_block("./testdata/block_367891/raw.zst")
+    }
+
+    /// Applies the CVE-2012-2459 padding to `block`: duplicates the trailing transactions that
+    /// sit under the last node of the lowest odd-width tree level, which reproduces the very same
+    /// merkle root. Returns how many transactions were duplicated.
+    ///
+    /// Blocks whose transaction count is a power of two have no odd level above the leaves and
+    /// cannot be padded this way, so this returns `None` for them.
+    fn duplicate_trailing_txs(block: &mut Block) -> Option<usize> {
+        let mut width = block.txdata.len();
+        let mut stride = 1;
+
+        while width > 1 {
+            if width % 2 == 1 {
+                let tail = block.txdata[block.txdata.len() - stride..].to_vec();
+                block.txdata.extend(tail);
+
+                return Some(stride);
+            }
+
+            width /= 2;
+            stride *= 2;
+        }
+
+        None
+    }
+
+    /// Removes every witness from `block`, which is what a peer serving the legacy (non-witness)
+    /// serialization of a block gives us.
+    fn strip_all_witnesses(block: &mut Block) {
+        for tx in block.txdata.iter_mut() {
+            for input in tx.input.iter_mut() {
+                input.witness = Witness::new();
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_block_mutated_accepts_honest_blocks() {
+        let blocks = [
+            genesis_block(Network::Bitcoin),
+            genesis_block(Network::Testnet),
+            genesis_block(Network::Testnet4),
+            genesis_block(Network::Signet),
+            genesis_block(Network::Regtest),
+            pre_segwit_block(),
+            segwit_block(),
+        ];
+
+        for block in blocks {
+            assert!(
+                !Consensus::is_block_mutated(&block, true),
+                "honest block {} flagged as mutated",
+                block.block_hash(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_block_mutated_duplicate_trailing_txs() {
+        let honest = segwit_block();
+        let mut mutated = honest.clone();
+
+        let duplicated =
+            duplicate_trailing_txs(&mut mutated).expect("tx count is not a power of 2");
+        assert!(duplicated.is_power_of_two());
+        assert_eq!(mutated.txdata.len(), honest.txdata.len() + duplicated);
+
+        // The whole point of this malleation: the header, and so the block hash, is untouched
+        assert_eq!(mutated.block_hash(), honest.block_hash());
+        assert_eq!(mutated.compute_merkle_root(), honest.compute_merkle_root());
+        // The pinned 0.32.8 does not catch this, which is why we compute the root ourselves.
+        // This assertion fails once the pin picks up rust-bitcoin#5116, which is the signal that
+        // `merkle_root_mutated` can go.
+        assert!(mutated.check_merkle_root());
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+        assert!(Consensus::check_merkle_root(&mutated).is_none());
+    }
+
+    #[test]
+    fn test_is_block_mutated_stripped_witnesses() {
+        let honest = segwit_block();
+        let mut mutated = honest.clone();
+        strip_all_witnesses(&mut mutated);
+
+        // Stripping witnesses leaves every txid, and therefore the block hash, unchanged
+        assert_eq!(mutated.block_hash(), honest.block_hash());
+        // The pinned 0.32.8 returns early here and calls the block committed, which is the gap.
+        // This assertion fails once the pin picks up rust-bitcoin#6250, which is the signal that
+        // `is_witness_malleated` can go.
+        assert!(mutated.check_witness_commitment());
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_single_stripped_witness() {
+        let mut mutated = segwit_block();
+        mutated.txdata[1].input[0].witness = Witness::new();
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_missing_witness_nonce() {
+        let mut mutated = segwit_block();
+        mutated.txdata[0].input[0].witness = Witness::new();
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_unexpected_witness() {
+        let mut mutated = pre_segwit_block();
+        assert!(!Consensus::is_block_mutated(&mutated, true));
+
+        // A block with no commitment must carry no witness data at all, otherwise a peer could
+        // pad it with arbitrary bytes. This keeps every txid, and so the merkle root, intact.
+        let mut witness = Witness::new();
+        witness.push([0x42; 32]);
+        mutated.txdata[1].input[0].witness = witness;
+
+        assert!(mutated.check_merkle_root());
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_reordered_txs() {
+        let mut mutated = segwit_block();
+        mutated.txdata.swap(1, 2);
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_empty_txdata() {
+        let mut mutated = segwit_block();
+        mutated.txdata.clear();
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    #[test]
+    fn test_is_block_mutated_first_tx_is_not_coinbase() {
+        let mut mutated = segwit_block();
+        mutated.txdata.remove(0);
+
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    /// A real mainnet block that carries a well-formed BIP-141 commitment in its coinbase while
+    /// carrying no witness data at all. 13,245 mainnet blocks between heights 434,499 and
+    /// 481,823 look like this: pool software emitted the commitment before the soft fork bound.
+    ///
+    /// Validating these against the commitment rejects the real chain, so the commitment half of
+    /// [`Consensus::is_witness_malleated`] must be gated on segwit activation, exactly as Bitcoin
+    /// Core gates it with `expect_witness_commitment`.
+    fn pre_segwit_commitment_block() -> Block {
+        decode_block("./testdata/block_434499/raw.zst")
+    }
+
+    #[test]
+    fn test_pre_segwit_commitment_block_is_accepted() {
+        let block = pre_segwit_commitment_block();
+        let height = 434_499;
+        let consensus = Consensus::from(Network::Bitcoin);
+
+        assert_eq!(
+            block.block_hash().to_string(),
+            "0000000000000000010821c880d75e6e325705bf19f01f3a5a9399fa5d4f06e6",
+        );
+        assert!(height < consensus.parameters.segwit_activation_height);
+
+        // The coinbase commits to a witness root...
+        let coinbase = &block.txdata[0];
+        assert!(coinbase.output.iter().any(|out| {
+            let spk = out.script_pubkey.as_bytes();
+            spk.len() >= 38 && spk[..6] == WITNESS_COMMITMENT_HEADER
+        }));
+
+        // ...but the block carries no witness data, not even the coinbase reserved value
+        assert!(
+            block
+                .txdata
+                .iter()
+                .all(|tx| tx.input.iter().all(|input| input.witness.is_empty())),
+        );
+
+        // Below the activation height the commitment binds nothing, so the block is valid
+        assert!(!Consensus::is_witness_malleated(&block, false));
+        assert!(!Consensus::is_block_mutated(&block, false));
+        consensus.check_block(&block, height).expect("valid block");
+
+        // Without the gate it would be rejected, which is what makes the gate load-bearing
+        assert!(Consensus::is_witness_malleated(&block, true));
+    }
+
+    /// Both malleations must surface as a merkle/commitment failure rather than as a missing UTXO
+    /// or a script failure. The distinction decides who gets blamed: the peer that sent the block,
+    /// or whoever supplied the proof, and whether the block gets invalidated in our chain.
+    #[test]
+    fn test_check_block_rejects_mutations() {
+        let height = 866_342;
+        let consensus = Consensus::from(Network::Bitcoin);
+        let honest = segwit_block();
+
+        consensus.check_block(&honest, height).expect("valid block");
+
+        let mut duplicated = honest.clone();
+        duplicate_trailing_txs(&mut duplicated).expect("tx count is not a power of 2");
+        assert!(matches!(
+            consensus.check_block(&duplicated, height),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadMerkleRoot
+            )),
+        ));
+
+        let mut stripped = honest.clone();
+        strip_all_witnesses(&mut stripped);
+        assert!(matches!(
+            consensus.check_block(&stripped, height),
+            Err(BlockchainError::BlockValidation(
+                BlockValidationErrors::BadWitnessCommitment
+            )),
+        ));
     }
 
     /// Modifies historical block at height 866,342 by adding one extra transaction so that the

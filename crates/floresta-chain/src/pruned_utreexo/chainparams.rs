@@ -129,6 +129,22 @@ pub struct AssumeUtreexoValue {
 }
 
 impl ChainParams {
+    /// The height at which segwit activates on `network`.
+    ///
+    /// This is the single source of truth for the constant: the [`From<Network>`] impl below
+    /// reads it from here. It is a `const fn` so that callers which only need this one number
+    /// don't have to build a whole [`ChainParams`], which allocates a genesis block and the
+    /// script-exception map.
+    pub const fn segwit_activation_height(network: Network) -> u32 {
+        match network {
+            Network::Bitcoin => 481_824,
+            Network::Testnet => 834_624,
+            Network::Testnet4 => 1,
+            Network::Signet => 1,
+            Network::Regtest => 0,
+        }
+    }
+
     /// This method is called when Assume Utreexo is set to true. It means that the user will accept the hardcoded utreexo state for the specified block, if it is found in the best chain. We can then sync rapidly from this state.
     pub fn get_assume_utreexo(network: Network) -> AssumeUtreexoValue {
         let genesis = genesis_block(Params::new(network));
@@ -330,7 +346,7 @@ impl From<Network> for ChainParams {
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
                 subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
-                segwit_activation_height: 481_824,
+                segwit_activation_height: Self::segwit_activation_height(network),
                 csv_activation_height: 419_328,
                 exceptions,
                 enforce_bip94: false,
@@ -342,7 +358,7 @@ impl From<Network> for ChainParams {
                 pow_target_timespan: 14 * 24 * 60 * 60, // two weeks
                 subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
-                segwit_activation_height: 834_624,
+                segwit_activation_height: Self::segwit_activation_height(network),
                 csv_activation_height: 770_112,
                 exceptions,
                 enforce_bip94: false,
@@ -354,7 +370,7 @@ impl From<Network> for ChainParams {
                 pow_target_timespan: 14 * 24 * 60 * 60,
                 subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
-                segwit_activation_height: 1,
+                segwit_activation_height: Self::segwit_activation_height(network),
                 csv_activation_height: 1,
                 exceptions,
                 enforce_bip94: true,
@@ -367,7 +383,7 @@ impl From<Network> for ChainParams {
                 subsidy_halving_interval: SubsidyHalvingInterval::Bitcoin,
                 coinbase_maturity: 100,
                 csv_activation_height: 1,
-                segwit_activation_height: 1,
+                segwit_activation_height: Self::segwit_activation_height(network),
                 exceptions,
                 enforce_bip94: false,
             },
@@ -379,7 +395,7 @@ impl From<Network> for ChainParams {
                 subsidy_halving_interval: SubsidyHalvingInterval::Regtest,
                 coinbase_maturity: 100,
                 csv_activation_height: 1,
-                segwit_activation_height: 0,
+                segwit_activation_height: Self::segwit_activation_height(network),
                 exceptions,
                 enforce_bip94: false,
             },

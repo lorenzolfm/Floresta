@@ -11,6 +11,8 @@ use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
 use floresta_chain::proof_util;
 use floresta_chain::proof_util::UtreexoLeafError;
+use floresta_chain::pruned_utreexo::chainparams::ChainParams;
+use floresta_chain::pruned_utreexo::consensus::Consensus;
 use floresta_common::service_flags;
 use floresta_common::try_and_log;
 use rustreexo::proof::Proof;
@@ -25,6 +27,7 @@ use crate::block_proof::Bitmap;
 use crate::block_proof::UtreexoProof;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
+use crate::node_handle::UserRequest;
 use crate::p2p_wire::error::WireError;
 
 /// The leaf data, utreexo proof and the peer that sent them.
@@ -117,6 +120,23 @@ where
         let block_hash = block.block_hash();
         self.inflight.remove(&InflightRequests::Blocks(block_hash));
 
+        // Reject mutated blocks before we spend a proof request on them.
+        //
+        // A mutated block keeps the header, so it can't tell us anything about the block behind
+        // this hash: only that `peer` lied. If we let it through, the utreexo peer that later
+        // answers with an honest proof gets blamed for the mismatch, and a witness-stripped block
+        // reaches script validation and invalidates a block that may well be valid.
+        // Core resolves the previous block for the same reason: the commitment check only
+        // applies once segwit is active. If we can't place the block yet, we can't run the
+        // gate, so we let it through and leave the decision to `check_block`.
+        if let Some(prev_height) = self.chain.get_block_height(&block.header.prev_blockhash)? {
+            let segwit_height = ChainParams::segwit_activation_height(self.network);
+
+            if Consensus::is_block_mutated(&block, prev_height + 1 >= segwit_height) {
+                return self.handle_mutated_block(block_hash, peer);
+            }
+        }
+
         // Reply and return early if it's a user-requested block. Else continue handling it.
         let Some(block) = self.check_is_user_block_and_reply(block)? else {
             return Ok(());
@@ -142,6 +162,70 @@ where
         }
 
         Ok(())
+    }
+
+    /// Bans the peer that sent us a mutated block, and re-arms the request it spoiled.
+    ///
+    /// The block itself is never invalidated: the header is untouched by mutation, so the real
+    /// block behind `block_hash` may be perfectly valid and we simply have not seen it yet.
+    ///
+    /// For a user request we retry with a *different* peer and keep the request open. If no other
+    /// peer can serve it, we drop the request so the caller gets an error, rather than leaving it
+    /// parked forever with nothing inflight to complete it. For everything else the regular
+    /// re-request machinery picks the block up on the next maintenance tick.
+    fn handle_mutated_block(
+        &mut self,
+        block_hash: BlockHash,
+        peer: PeerId,
+    ) -> Result<(), WireError> {
+        error!("Peer {peer} sent us a mutated block {block_hash}");
+
+        let ban_result = self.disconnect_and_ban(peer);
+
+        let is_user_request = self
+            .inflight_user_requests
+            .contains_key(&UserRequest::Block(block_hash));
+
+        if !is_user_request {
+            ban_result?;
+
+            return Err(WireError::PeerMisbehaving);
+        }
+
+        // Retry elsewhere. `peer` is excluded explicitly, since a manual peer is exempt from
+        // bans and would otherwise stay eligible for the request it just failed.
+        let retry = ban_result.and_then(|_| {
+            self.send_to_fast_peer_except(
+                NodeRequest::GetBlock(vec![block_hash]),
+                ServiceFlags::NETWORK,
+                Some(peer),
+            )
+        });
+
+        match retry {
+            Ok(new_peer) => {
+                // The inflight entry keeps the user request covered by the timeout machinery,
+                // which re-requests it if this peer goes quiet too.
+                self.inflight.insert(
+                    InflightRequests::Blocks(block_hash),
+                    (new_peer, Instant::now()),
+                );
+
+                Ok(())
+            }
+
+            Err(e) => {
+                warn!("Could not retry mutated block {block_hash} with another peer: {e:?}");
+
+                // Dropping the responder wakes the caller with an error. Leaving it in place
+                // would hang them forever: nothing sweeps `inflight_user_requests` for
+                // timeouts, and no inflight entry remains to trigger a re-request.
+                self.inflight_user_requests
+                    .remove(&UserRequest::Block(block_hash));
+
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn attach_proof(
