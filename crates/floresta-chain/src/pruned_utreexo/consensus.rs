@@ -616,7 +616,7 @@ impl Consensus {
     /// 0.102.0), by returning `None` for an ambiguous tree. **Once the `bitcoin` pin moves past
     /// 0.33, this function is redundant and should be dropped** in favour of the upstream check.
     ///
-    /// [`ComputeMerkleRoot`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/consensus/merkle.cpp#L15
+    /// [`ComputeMerkleRoot`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/consensus/merkle.cpp#L46
     /// [rust-bitcoin#5116]: https://github.com/rust-bitcoin/rust-bitcoin/pull/5116
     fn merkle_root_mutated(mut hashes: Vec<sha256d::Hash>) -> (Option<sha256d::Hash>, bool) {
         if hashes.is_empty() {
@@ -665,7 +665,7 @@ impl Consensus {
     /// same way we do here ([rust-bitcoin#6250], unreleased as of `bitcoin-primitives` 0.102.0).
     /// **Once the `bitcoin` pin includes that fix, this function is redundant.**
     ///
-    /// [`CheckWitnessMalleation`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L3889
+    /// [`CheckWitnessMalleation`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L3966
     /// [rust-bitcoin#6250]: https://github.com/rust-bitcoin/rust-bitcoin/pull/6250
     fn is_witness_malleated(block: &Block) -> bool {
         let Some(coinbase) = block.txdata.first() else {
@@ -725,7 +725,7 @@ impl Consensus {
     /// failure is attributable to the sender rather than to the miner, mirroring Bitcoin Core's
     /// [`IsBlockMutated`].
     ///
-    /// [`IsBlockMutated`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L4046
+    /// [`IsBlockMutated`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L4126
     pub fn is_block_mutated(block: &Block) -> bool {
         if Self::check_merkle_root(block).is_none() {
             return true;
