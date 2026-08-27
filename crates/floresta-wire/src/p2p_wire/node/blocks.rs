@@ -11,6 +11,7 @@ use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
 use floresta_chain::proof_util;
 use floresta_chain::proof_util::UtreexoLeafError;
+use floresta_chain::pruned_utreexo::chainparams::ChainParams;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
 use floresta_common::service_flags;
 use floresta_common::try_and_log;
@@ -125,8 +126,15 @@ where
         // this hash: only that `peer` lied. If we let it through, the utreexo peer that later
         // answers with an honest proof gets blamed for the mismatch, and a witness-stripped block
         // reaches script validation and invalidates a block that may well be valid.
-        if Consensus::is_block_mutated(&block) {
-            return self.handle_mutated_block(block_hash, peer);
+        // Core resolves the previous block for the same reason: the commitment check only
+        // applies once segwit is active. If we can't place the block yet, we can't run the
+        // gate, so we let it through and leave the decision to `check_block`.
+        if let Some(prev_height) = self.chain.get_block_height(&block.header.prev_blockhash)? {
+            let segwit_height = ChainParams::segwit_activation_height(self.network);
+
+            if Consensus::is_block_mutated(&block, prev_height + 1 >= segwit_height) {
+                return self.handle_mutated_block(block_hash, peer);
+            }
         }
 
         // Reply and return early if it's a user-requested block. Else continue handling it.

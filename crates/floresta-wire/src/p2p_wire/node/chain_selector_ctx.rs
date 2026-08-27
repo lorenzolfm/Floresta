@@ -58,6 +58,7 @@ use floresta_chain::ChainBackend;
 use floresta_chain::CompactLeafData;
 use floresta_chain::proof_util;
 use floresta_chain::pruned_utreexo::IBDState;
+use floresta_chain::pruned_utreexo::chainparams::ChainParams;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
 use floresta_common::service_flags;
 use floresta_common::try_and_log;
@@ -480,8 +481,13 @@ where
                         return Err(WireError::PeerMisbehaving);
                     }
 
-                    // Check if the blocks was maliciously mutated by our peer
-                    if Consensus::is_block_mutated(&recv_block) {
+                    // Check if the block was maliciously mutated by our peer. The commitment
+                    // half of the check only applies once segwit is active, so we need the
+                    // height; we know this hash, since we asked for it by height.
+                    let height = self.chain.get_block_height(&block_hash)?.unwrap_or(0);
+                    let segwit_height = ChainParams::segwit_activation_height(self.network);
+
+                    if Consensus::is_block_mutated(&recv_block, height >= segwit_height) {
                         error!(
                             "Peer {peer} sent us a mutated block {}",
                             recv_block.block_hash()

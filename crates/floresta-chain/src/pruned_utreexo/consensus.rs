@@ -574,7 +574,8 @@ impl Consensus {
             Err(BlockValidationErrors::BadBip34)?;
         }
 
-        if Self::is_witness_malleated(block) {
+        let segwit_active = height >= self.parameters.segwit_activation_height;
+        if Self::is_witness_malleated(block, segwit_active) {
             Err(BlockValidationErrors::BadWitnessCommitment)?;
         }
 
@@ -659,6 +660,13 @@ impl Consensus {
     /// the commitment first, and only fall back to "then no transaction may carry witness data"
     /// when there is none.
     ///
+    /// `segwit_active` gates the commitment half, exactly as Core's `expect_witness_commitment`
+    /// does. It is **not** optional: BIP-141 deploys the commitment as a soft fork, so before
+    /// activation `aa21a9ed` is an ordinary `OP_RETURN` that binds nothing. 13,245 mainnet
+    /// blocks between heights 434,499 and 481,823 carry a well-formed commitment with no
+    /// witness data at all, because pool software emitted it before the rule bound. Validating
+    /// those against the commitment rejects the real chain.
+    ///
     /// The pinned `bitcoin` 0.32.8 does the opposite: [`Block::check_witness_commitment`] returns
     /// `true` as soon as every witness is empty, which lets a witness-stripped block pass even
     /// though its coinbase still commits to witness data. Upstream has since reordered it the
@@ -667,17 +675,25 @@ impl Consensus {
     ///
     /// [`CheckWitnessMalleation`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L3966
     /// [rust-bitcoin#6250]: https://github.com/rust-bitcoin/rust-bitcoin/pull/6250
-    fn is_witness_malleated(block: &Block) -> bool {
+    fn is_witness_malleated(block: &Block, segwit_active: bool) -> bool {
         let Some(coinbase) = block.txdata.first() else {
             return true;
         };
 
-        let commitment = coinbase.output.iter().rev().find_map(|out| {
-            let spk = out.script_pubkey.as_bytes();
-            let is_commitment = spk.len() >= 38 && spk[..6] == WITNESS_COMMITMENT_HEADER;
+        // Before segwit activates, `aa21a9ed` is an ordinary OP_RETURN with no consensus
+        // meaning, so a commitment output binds nothing and must not be validated. Skipping
+        // the lookup leaves only the "no witness data at all" rule, which Core enforces at
+        // every height. See the note on the activation gate above.
+        let commitment = segwit_active
+            .then(|| {
+                coinbase.output.iter().rev().find_map(|out| {
+                    let spk = out.script_pubkey.as_bytes();
+                    let is_commitment = spk.len() >= 38 && spk[..6] == WITNESS_COMMITMENT_HEADER;
 
-            is_commitment.then(|| &spk[6..38])
-        });
+                    is_commitment.then(|| &spk[6..38])
+                })
+            })
+            .flatten();
 
         let Some(commitment) = commitment else {
             // Without a commitment, no transaction may carry witness data. Otherwise a peer
@@ -725,8 +741,13 @@ impl Consensus {
     /// failure is attributable to the sender rather than to the miner, mirroring Bitcoin Core's
     /// [`IsBlockMutated`].
     ///
+    /// `segwit_active` says whether the block's height is at or above the segwit activation
+    /// height; it gates the commitment check in [`Self::is_witness_malleated`]. Core passes the
+    /// same flag from `DeploymentActiveAfter(prev_block, ..., DEPLOYMENT_SEGWIT)`, and skips the
+    /// mutation check altogether when it cannot resolve the previous block.
+    ///
     /// [`IsBlockMutated`]: https://github.com/bitcoin/bitcoin/blob/v30.0/src/validation.cpp#L4126
-    pub fn is_block_mutated(block: &Block) -> bool {
+    pub fn is_block_mutated(block: &Block, segwit_active: bool) -> bool {
         if Self::check_merkle_root(block).is_none() {
             return true;
         }
@@ -742,7 +763,7 @@ impl Consensus {
             return block.txdata.iter().any(|tx| tx.base_size() == 64);
         }
 
-        Self::is_witness_malleated(block)
+        Self::is_witness_malleated(block, segwit_active)
     }
 
     /// Validates a block under AssumeValid SwiftSync, where previous outputs are unavailable,
@@ -1530,7 +1551,7 @@ mod tests {
 
         for block in blocks {
             assert!(
-                !Consensus::is_block_mutated(&block),
+                !Consensus::is_block_mutated(&block, true),
                 "honest block {} flagged as mutated",
                 block.block_hash(),
             );
@@ -1555,7 +1576,7 @@ mod tests {
         // `merkle_root_mutated` can go.
         assert!(mutated.check_merkle_root());
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
         assert!(Consensus::check_merkle_root(&mutated).is_none());
     }
 
@@ -1572,7 +1593,7 @@ mod tests {
         // `is_witness_malleated` can go.
         assert!(mutated.check_witness_commitment());
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
@@ -1580,7 +1601,7 @@ mod tests {
         let mut mutated = segwit_block();
         mutated.txdata[1].input[0].witness = Witness::new();
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
@@ -1588,13 +1609,13 @@ mod tests {
         let mut mutated = segwit_block();
         mutated.txdata[0].input[0].witness = Witness::new();
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
     fn test_is_block_mutated_unexpected_witness() {
         let mut mutated = pre_segwit_block();
-        assert!(!Consensus::is_block_mutated(&mutated));
+        assert!(!Consensus::is_block_mutated(&mutated, true));
 
         // A block with no commitment must carry no witness data at all, otherwise a peer could
         // pad it with arbitrary bytes. This keeps every txid, and so the merkle root, intact.
@@ -1603,7 +1624,7 @@ mod tests {
         mutated.txdata[1].input[0].witness = witness;
 
         assert!(mutated.check_merkle_root());
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
@@ -1611,7 +1632,7 @@ mod tests {
         let mut mutated = segwit_block();
         mutated.txdata.swap(1, 2);
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
@@ -1619,7 +1640,7 @@ mod tests {
         let mut mutated = segwit_block();
         mutated.txdata.clear();
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
     }
 
     #[test]
@@ -1627,7 +1648,54 @@ mod tests {
         let mut mutated = segwit_block();
         mutated.txdata.remove(0);
 
-        assert!(Consensus::is_block_mutated(&mutated));
+        assert!(Consensus::is_block_mutated(&mutated, true));
+    }
+
+    /// A real mainnet block that carries a well-formed BIP-141 commitment in its coinbase while
+    /// carrying no witness data at all. 13,245 mainnet blocks between heights 434,499 and
+    /// 481,823 look like this: pool software emitted the commitment before the soft fork bound.
+    ///
+    /// Validating these against the commitment rejects the real chain, so the commitment half of
+    /// [`Consensus::is_witness_malleated`] must be gated on segwit activation, exactly as Bitcoin
+    /// Core gates it with `expect_witness_commitment`.
+    fn pre_segwit_commitment_block() -> Block {
+        decode_block("./testdata/block_434499/raw.zst")
+    }
+
+    #[test]
+    fn test_pre_segwit_commitment_block_is_accepted() {
+        let block = pre_segwit_commitment_block();
+        let height = 434_499;
+        let consensus = Consensus::from(Network::Bitcoin);
+
+        assert_eq!(
+            block.block_hash().to_string(),
+            "0000000000000000010821c880d75e6e325705bf19f01f3a5a9399fa5d4f06e6",
+        );
+        assert!(height < consensus.parameters.segwit_activation_height);
+
+        // The coinbase commits to a witness root...
+        let coinbase = &block.txdata[0];
+        assert!(coinbase.output.iter().any(|out| {
+            let spk = out.script_pubkey.as_bytes();
+            spk.len() >= 38 && spk[..6] == WITNESS_COMMITMENT_HEADER
+        }));
+
+        // ...but the block carries no witness data, not even the coinbase reserved value
+        assert!(
+            block
+                .txdata
+                .iter()
+                .all(|tx| tx.input.iter().all(|input| input.witness.is_empty())),
+        );
+
+        // Below the activation height the commitment binds nothing, so the block is valid
+        assert!(!Consensus::is_witness_malleated(&block, false));
+        assert!(!Consensus::is_block_mutated(&block, false));
+        consensus.check_block(&block, height).expect("valid block");
+
+        // Without the gate it would be rejected, which is what makes the gate load-bearing
+        assert!(Consensus::is_witness_malleated(&block, true));
     }
 
     /// Both malleations must surface as a merkle/commitment failure rather than as a missing UTXO
