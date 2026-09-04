@@ -443,27 +443,24 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         ))
     }
 
-    fn reorg_acc(&self, fork_point: &BlockHeader) -> Result<Stump, BlockchainError> {
-        let height = self
-            .get_block_height(&fork_point.block_hash())?
-            .ok_or(BlockchainError::BlockNotPresent)?;
-
-        Ok(self.get_roots_for_block(height)?.unwrap_or_default())
-    }
-
     // This method should only be called after we validate the new branch
     fn reorg(&self, new_tip: BlockHeader) -> Result<(), BlockchainError> {
         let current_best_block = self.get_block_header(&self.get_best_block()?.1)?;
         let fork_point = self.find_fork_point(&new_tip)?;
+        let fork_height = self
+            .get_block_height(&fork_point.block_hash())?
+            .ok_or(BlockchainError::BlockNotPresent)?;
+
+        let validation_index = self.get_last_valid_block(&new_tip)?;
+        let acc = self.get_roots_for_block(fork_height)?.unwrap_or_default();
+
+        self.change_active_chain(&fork_point, validation_index, fork_height, acc);
 
         self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
         self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
 
-        let validation_index = self.get_last_valid_block(&new_tip)?;
         let depth = self.get_chain_depth(&new_tip)?;
-        let acc = self.reorg_acc(&fork_point)?;
-
-        self.change_active_chain(&new_tip, validation_index, depth, acc);
+        self.update_tip(new_tip.block_hash(), depth);
 
         Ok(())
     }
@@ -908,22 +905,30 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         Stump::deserialize(&mut acc).map_err(BlockchainError::AccumulatorError)
     }
 
+    fn persist_valid_block(
+        &self,
+        height: u32,
+        block: &BlockHeader,
+        acc: &Stump,
+    ) -> Result<(), BlockchainError> {
+        let mut roots = Vec::new();
+        acc.serialize(&mut roots)?;
+
+        let mut store = self.store.write();
+        store.save_header(&DiskBlockHeader::FullyValid(*block, height))?;
+        store.update_block_index(height, block.block_hash())?;
+        store.save_roots_for_block(roots, height)?;
+
+        Ok(())
+    }
+
     fn update_view(
         &self,
         height: u32,
         block: &BlockHeader,
         acc: Stump,
     ) -> Result<(), BlockchainError> {
-        // save roots for this block
-        let mut roots = Vec::new();
-        acc.serialize(&mut roots)?;
-
-        {
-            let mut store = self.store.write();
-            store.save_header(&DiskBlockHeader::FullyValid(*block, height))?;
-            store.update_block_index(height, block.block_hash())?;
-            store.save_roots_for_block(roots, height)?;
-        }
+        self.persist_valid_block(height, block, &acc)?;
 
         self.update_snapshot(|snapshot| {
             snapshot.acc = acc;
@@ -1294,7 +1299,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             curr_header = self.get_ancestor(&header)?;
         }
 
-        self.update_view(curr_header.try_height()?, &curr_header, acc.clone())?;
+        self.persist_valid_block(curr_header.try_height()?, &curr_header, &acc)?;
 
         self.update_snapshot(|snapshot| {
             snapshot.best_block.validation_index = assumed_hash;
@@ -1305,23 +1310,20 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     }
 
     fn invalidate_block(&self, block: BlockHash) -> Result<(), BlockchainError> {
-        let height = self.get_disk_block_header(&block)?.try_height()?;
+        let header = self.get_disk_block_header(&block)?;
+        let height = header.try_height()?;
         let current_height = self.get_height()?;
 
-        // Mark all blocks after this one as invalid
+        let new_tip = self.get_ancestor(&header)?.block_hash();
+        self.update_tip(new_tip, height - 1);
+
         for h in height..=current_height {
             let hash = self.get_block_hash(h)?;
             let header = self.get_block_header(&hash)?;
             let new_header = DiskBlockHeader::InvalidChain(header);
             self.update_header(&new_header)?;
         }
-        // Row back to our previous state. Note that acc doesn't actually change in this case
-        // only the currently best known block.
-        self.update_tip(
-            self.get_ancestor(&self.get_block_header(&block)?)?
-                .block_hash(),
-            height - 1,
-        );
+
         Ok(())
     }
 
