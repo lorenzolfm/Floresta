@@ -139,6 +139,25 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
     ibd: IBDState,
 }
 
+impl<PersistedState: ChainStore> ChainStateInner<PersistedState> {
+    fn snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            best_block: self.best_block.clone(),
+            acc: self.acc.clone(),
+            ibd: self.ibd,
+            fee_estimation: self.fee_estimation,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainSnapshot {
+    pub best_block: BestChain,
+    pub acc: Stump,
+    pub ibd: IBDState,
+    pub fee_estimation: (f64, f64, f64),
+}
+
 /// The high-level chain backend managing the blockchain state.
 ///
 /// `ChainState` is responsible for:
@@ -147,6 +166,7 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
 /// - Interfacing with other components and providing data about the current view of the chain.
 pub struct ChainState<PersistedState: ChainStore> {
     inner: RwLock<ChainStateInner<PersistedState>>,
+    snapshot: RwLock<Arc<ChainSnapshot>>,
     /// Parameters for the chain and functions that verify the chain.
     consensus: Consensus,
     /// Assume valid is a Core-specific config that tells the node to not validate signatures
@@ -171,6 +191,14 @@ pub enum AssumeValidArg {
 }
 
 impl<PersistedState: ChainStore> ChainState<PersistedState> {
+    pub fn snapshot(&self) -> Arc<ChainSnapshot> {
+        self.snapshot.read().clone()
+    }
+
+    fn publish(&self, inner: &ChainStateInner<PersistedState>) {
+        *self.snapshot.write() = Arc::new(inner.snapshot());
+    }
+
     fn maybe_reindex(&self, potential_tip: &DiskBlockHeader) -> Result<(), BlockchainError> {
         if let DiskBlockHeader::HeadersOnly(_, height) = potential_tip {
             let best_height = self.get_best_block()?.0;
@@ -437,6 +465,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let acc = self.get_roots_for_block(height)?.unwrap_or_default();
         let mut inner = write_lock!(self);
         inner.acc = acc;
+        self.publish(&inner);
 
         Ok(())
     }
@@ -464,6 +493,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         inner.best_block.best_block = new_tip.block_hash();
         inner.best_block.validation_index = last_valid;
         inner.best_block.depth = depth;
+        self.publish(&inner);
     }
 
     /// Grabs the last block we validated in this branch. We don't validate a fork, unless it
@@ -550,6 +580,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             .best_block
             .alternative_tips
             .push(branch_tip.block_hash());
+        self.publish(&inner);
         Ok(())
     }
 
@@ -604,20 +635,23 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let assume_valid = ChainParams::get_assume_valid(network, assume_valid);
 
+        let inner = ChainStateInner {
+            chainstore,
+            acc: Stump::new(),
+            best_block: BestChain {
+                best_block: genesis.block_hash(),
+                depth: 0,
+                validation_index: genesis.block_hash(),
+                alternative_tips: Vec::new(),
+            },
+            subscribers: Vec::new(),
+            fee_estimation: (1_f64, 1_f64, 1_f64),
+            ibd: IBDState::HeadersSync,
+        };
+
         Self {
-            inner: RwLock::new(ChainStateInner {
-                chainstore,
-                acc: Stump::new(),
-                best_block: BestChain {
-                    best_block: genesis.block_hash(),
-                    depth: 0,
-                    validation_index: genesis.block_hash(),
-                    alternative_tips: Vec::new(),
-                },
-                subscribers: Vec::new(),
-                fee_estimation: (1_f64, 1_f64, 1_f64),
-                ibd: IBDState::HeadersSync,
-            }),
+            snapshot: RwLock::new(Arc::new(inner.snapshot())),
+            inner: RwLock::new(inner),
             consensus: Consensus { parameters },
             assume_valid,
         }
@@ -696,9 +730,12 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             inner.acc = acc;
             inner.best_block = best_chain.clone();
             inner.best_block.validation_index = last_acc_header.block_hash();
+            self.publish(&inner);
         } else {
             // We may reindex as well during chain selection (no acc nor validation index)
-            write_lock!(self).best_block = best_chain.clone();
+            let mut inner = write_lock!(self);
+            inner.best_block = best_chain.clone();
+            self.publish(&inner);
         }
 
         debug!(
@@ -787,6 +824,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         );
 
         let chainstate = Self {
+            snapshot: RwLock::new(Arc::new(inner.snapshot())),
             inner: RwLock::new(inner),
             consensus: Consensus {
                 parameters: network.into(),
@@ -927,6 +965,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         // Updates our local view of the network
         inner.acc = acc;
         inner.best_block.valid_block(block.block_hash());
+        self.publish(&inner);
 
         Ok(())
     }
@@ -935,6 +974,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let mut inner = write_lock!(self);
         inner.best_block.best_block = best_block;
         inner.best_block.depth = height;
+        self.publish(&inner);
     }
 
     fn verify_script(&self, height: u32) -> Result<bool, PersistedState::Error> {
@@ -1301,6 +1341,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         let mut guard = write_lock!(self);
         guard.best_block.validation_index = assumed_hash;
         guard.acc = acc;
+        self.publish(&guard);
 
         Ok(true)
     }
@@ -1329,6 +1370,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     fn update_ibd(&self, ibd_state: IBDState) {
         let mut inner = write_lock!(self);
         inner.ibd = ibd_state;
+        self.publish(&inner);
     }
 
     fn connect_block(
@@ -1457,7 +1499,11 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             let height = best_block.0 + 1;
             debug!("Header builds on top of our best chain");
 
-            write_lock!(self).best_block.new_block(block_hash, height);
+            {
+                let mut inner = write_lock!(self);
+                inner.best_block.new_block(block_hash, height);
+                self.publish(&inner);
+            }
             let disk_header = DiskBlockHeader::HeadersOnly(header, height);
 
             self.update_header_and_index(&disk_header, block_hash, height)?;
@@ -1522,6 +1568,7 @@ impl<T: ChainStore> TryFrom<ChainStateBuilder<T>> for ChainState<T> {
         };
 
         Ok(Self {
+            snapshot: RwLock::new(Arc::new(inner.snapshot())),
             inner: RwLock::new(inner),
             consensus: Consensus {
                 parameters: builder.chain_params()?,
