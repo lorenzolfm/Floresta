@@ -992,7 +992,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         }
     }
     pub fn acc(&self) -> Stump {
-        read_lock!(self).acc.to_owned()
+        self.snapshot().acc.clone()
     }
     /// Returns the next required work for the next block, usually it's just the last block's target
     /// but if we are in a retarget period, it's calculated from the last 2016 blocks.
@@ -1098,7 +1098,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn acc(&self) -> Stump {
-        read_lock!(self).acc.to_owned()
+        self.snapshot().acc.clone()
     }
 
     fn size_on_disk(&self) -> Result<u64, Self::Error> {
@@ -1122,11 +1122,11 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn get_chain_tips(&self) -> Result<Vec<BlockHash>, Self::Error> {
-        let inner = read_lock!(self);
+        let snapshot = self.snapshot();
         let mut tips = Vec::new();
 
-        tips.push(inner.best_block.best_block);
-        tips.extend(inner.best_block.alternative_tips.iter());
+        tips.push(snapshot.best_block.best_block);
+        tips.extend(snapshot.best_block.alternative_tips.iter());
 
         Ok(tips)
     }
@@ -1190,7 +1190,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn is_in_ibd(&self) -> bool {
-        self.inner.read().ibd != IBDState::Done
+        self.snapshot().ibd != IBDState::Done
     }
 
     fn get_block_height(&self, hash: &BlockHash) -> Result<Option<u32>, Self::Error> {
@@ -1210,18 +1210,17 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn get_height(&self) -> Result<u32, Self::Error> {
-        let inner = read_lock!(self);
-        Ok(inner.best_block.depth)
+        Ok(self.snapshot().best_block.depth)
     }
 
     fn estimate_fee(&self, target: usize) -> Result<f64, Self::Error> {
-        let inner = read_lock!(self);
+        let fee_estimation = self.snapshot().fee_estimation;
         if target == 1 {
-            Ok(inner.fee_estimation.0)
+            Ok(fee_estimation.0)
         } else if target == 10 {
-            Ok(inner.fee_estimation.1)
+            Ok(fee_estimation.1)
         } else {
-            Ok(inner.fee_estimation.2)
+            Ok(fee_estimation.2)
         }
     }
 
@@ -1230,8 +1229,8 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn get_best_block(&self) -> Result<(u32, BlockHash), Self::Error> {
-        let inner = read_lock!(self);
-        Ok((inner.best_block.depth, inner.best_block.best_block))
+        let snapshot = self.snapshot();
+        Ok((snapshot.best_block.depth, snapshot.best_block.best_block))
     }
 
     fn get_block_header(&self, hash: &BlockHash) -> Result<BlockHeader, Self::Error> {
@@ -1273,8 +1272,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn get_validation_index(&self) -> Result<u32, Self::Error> {
-        let inner = self.inner.read();
-        let validation = inner.best_block.validation_index;
+        let validation = self.snapshot().best_block.validation_index;
         let header = self.get_disk_block_header(&validation)?;
         // The last validated disk header can only be FullyValid
         if let DiskBlockHeader::FullyValid(_, height) = header {
@@ -1292,8 +1290,7 @@ impl<PersistedState: ChainStore> BlockchainInterface for ChainState<PersistedSta
     }
 
     fn ibd_state(&self) -> IBDState {
-        let inner = read_lock!(self);
-        inner.ibd
+        self.snapshot().ibd
     }
 
     fn get_warnings(&self) -> Vec<ChainStoreWarning> {
@@ -1517,8 +1514,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
     }
 
     fn get_root_hashes(&self) -> Vec<BitcoinNodeHash> {
-        let inner = read_lock!(self);
-        inner.acc.roots.clone()
+        self.snapshot().acc.roots.clone()
     }
 
     fn get_partial_chain(
@@ -2343,7 +2339,7 @@ mod test {
         // get_block_locator_for_tip
         assert!(
             !chain
-                .get_block_locator_for_tip(read_lock!(chain).best_block.best_block)
+                .get_block_locator_for_tip(chain.snapshot().best_block.best_block)
                 .unwrap()
                 .is_empty()
         );
@@ -2363,7 +2359,7 @@ mod test {
         // update_tip
         chain.update_tip(headers[1].prev_blockhash, 1);
         assert_eq!(
-            read_lock!(chain).best_block.best_block,
+            chain.snapshot().best_block.best_block,
             headers[1].prev_blockhash
         );
     }
