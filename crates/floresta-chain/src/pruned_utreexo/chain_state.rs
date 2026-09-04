@@ -137,12 +137,6 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
     fee_estimation: (f64, f64, f64),
     /// What is our current IBD state?
     ibd: IBDState,
-    /// Parameters for the chain and functions that verify the chain.
-    consensus: Consensus,
-    /// Assume valid is a Core-specific config that tells the node to not validate signatures
-    /// in blocks before this one. Note that we only skip signature validation, everything else
-    /// is still validated.
-    assume_valid: Option<BlockHash>,
 }
 
 /// The high-level chain backend managing the blockchain state.
@@ -153,6 +147,12 @@ pub struct ChainStateInner<PersistedState: ChainStore> {
 /// - Interfacing with other components and providing data about the current view of the chain.
 pub struct ChainState<PersistedState: ChainStore> {
     inner: RwLock<ChainStateInner<PersistedState>>,
+    /// Parameters for the chain and functions that verify the chain.
+    consensus: Consensus,
+    /// Assume valid is a Core-specific config that tells the node to not validate signatures
+    /// in blocks before this one. Note that we only skip signature validation, everything else
+    /// is still validated.
+    assume_valid: Option<BlockHash>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -555,9 +555,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
     /// Returns the chain_params struct for the current network
     fn chain_params(&self) -> ChainParams {
-        let inner = read_lock!(self);
-        // We clone the parameters here, because we don't want to hold the lock for too long
-        inner.consensus.parameters.clone()
+        self.consensus.parameters.clone()
     }
 
     fn get_header_by_height(&self, height: u32) -> Result<DiskBlockHeader, BlockchainError> {
@@ -619,9 +617,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
                 subscribers: Vec::new(),
                 fee_estimation: (1_f64, 1_f64, 1_f64),
                 ibd: IBDState::HeadersSync,
-                consensus: Consensus { parameters },
-                assume_valid,
             }),
+            consensus: Consensus { parameters },
+            assume_valid,
         }
     }
 
@@ -781,10 +779,6 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
             fee_estimation: (1_f64, 1_f64, 1_f64),
             subscribers: Vec::new(),
             ibd: IBDState::HeadersSync,
-            consensus: Consensus {
-                parameters: network.into(),
-            },
-            assume_valid: ChainParams::get_assume_valid(network, assume_valid),
         };
 
         info!(
@@ -794,6 +788,10 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let chainstate = Self {
             inner: RwLock::new(inner),
+            consensus: Consensus {
+                parameters: network.into(),
+            },
+            assume_valid: ChainParams::get_assume_valid(network, assume_valid),
         };
 
         // Check the integrity of our chain
@@ -940,10 +938,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
     }
 
     fn verify_script(&self, height: u32) -> Result<bool, PersistedState::Error> {
-        let inner = self.inner.read();
-        match inner.assume_valid {
+        match self.assume_valid {
             Some(hash) => {
-                match inner.chainstore.get_header(&hash)? {
+                match read_lock!(self).chainstore.get_header(&hash)? {
                     // If the assume-valid block is in the best chain, only verify scripts if we are higher
                     Some(DiskBlockHeader::HeadersOnly(_, assume_h))
                     | Some(DiskBlockHeader::FullyValid(_, assume_h)) => Ok(height > assume_h),
@@ -1019,7 +1016,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         height: u32,
         inputs: HashMap<OutPoint, UtxoData>,
     ) -> Result<(), BlockchainError> {
-        let consensus = read_lock!(self).consensus.clone();
+        let consensus = &self.consensus;
         consensus.check_block(block, height)?;
 
         // Validate block transactions
@@ -1519,17 +1516,18 @@ impl<T: ChainStore> TryFrom<ChainStateBuilder<T>> for ChainState<T> {
             acc: builder.acc().unwrap_or_default(),
             chainstore: builder.chainstore()?,
             best_block: builder.best_block()?,
-            assume_valid: builder.assume_valid(),
             ibd: builder.ibd_state(),
             subscribers: Vec::new(),
             fee_estimation: (1_f64, 1_f64, 1_f64),
+        };
+
+        Ok(Self {
+            inner: RwLock::new(inner),
             consensus: Consensus {
                 parameters: builder.chain_params()?,
             },
-        };
-
-        let inner = RwLock::new(inner);
-        Ok(Self { inner })
+            assume_valid: builder.assume_valid(),
+        })
     }
 }
 
