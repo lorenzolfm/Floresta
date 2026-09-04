@@ -1533,6 +1533,9 @@ mod test {
     use std::format;
     use std::fs::File;
     use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::thread;
     use std::vec::Vec;
 
     use bitcoin::Block;
@@ -2370,5 +2373,140 @@ mod test {
         assert_eq!(work.to_string_hex(), expected_hex_string);
         assert_eq!(fork_work, work);
         assert_eq!(work, expected_work);
+    }
+
+    fn reorg_test_blocks() -> (Vec<Block>, Vec<Block>) {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        (parse_blocks(&blocks[0]), parse_blocks(&blocks[1]))
+    }
+
+    fn assert_snapshot_consistent(chain: &ChainState<FlatChainStore>) {
+        let snapshot = chain.snapshot();
+
+        let tip = chain
+            .get_disk_block_header(&snapshot.best_block.best_block)
+            .expect("the tip must be in the store before it is published");
+        assert_eq!(
+            tip.height(),
+            Some(snapshot.best_block.depth),
+            "tip and depth must come from the same block"
+        );
+
+        let validation_index = chain
+            .get_disk_block_header(&snapshot.best_block.validation_index)
+            .expect("the validation index must be in the store before it is published");
+        let DiskBlockHeader::FullyValid(_, height) = validation_index else {
+            panic!("the validation index must be FullyValid, got {validation_index:?}");
+        };
+
+        if height == 0 {
+            assert_eq!(
+                snapshot.acc,
+                Stump::new(),
+                "genesis has an empty accumulator"
+            );
+            return;
+        }
+
+        let stored_acc = chain
+            .get_roots_for_block(height)
+            .unwrap()
+            .expect("the roots must be stored before the accumulator is published");
+        assert_eq!(
+            snapshot.acc, stored_acc,
+            "the accumulator must be the one stored for the validation index"
+        );
+    }
+
+    #[test]
+    fn snapshot_stays_consistent_while_blocks_are_connected() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        let (short_chain, long_chain) = reorg_test_blocks();
+        let done = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !done.load(Ordering::Acquire) {
+                        assert_snapshot_consistent(&chain);
+                    }
+                });
+            }
+
+            for block in &short_chain {
+                chain.accept_header(block.header).unwrap();
+                chain
+                    .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                    .unwrap();
+            }
+
+            for block in &long_chain {
+                chain.accept_header(block.header).unwrap();
+            }
+
+            for block in &long_chain {
+                chain
+                    .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                    .unwrap();
+            }
+
+            done.store(true, Ordering::Release);
+        });
+
+        assert_snapshot_consistent(&chain);
+        assert_eq!(
+            chain.get_best_block().unwrap(),
+            (
+                16,
+                bhash!("4572ac401b94915dde6c4957b706abdb13b5824b000cad7f6065ebd9aea6dad1")
+            ),
+        );
+        assert_eq!(chain.get_validation_index().unwrap(), 16);
+    }
+
+    #[test]
+    fn flush_runs_alongside_snapshot_readers() {
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        let (short_chain, _) = reorg_test_blocks();
+        let done = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    let (height, hash) = chain.get_best_block().unwrap();
+                    assert_eq!(chain.get_block_hash(height).unwrap(), hash);
+                    assert_eq!(chain.get_block_header(&hash).unwrap().block_hash(), hash);
+                }
+            });
+
+            for block in &short_chain {
+                chain.accept_header(block.header).unwrap();
+                chain
+                    .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                    .unwrap();
+                chain.flush().unwrap();
+            }
+
+            done.store(true, Ordering::Release);
+        });
+
+        let snapshot = chain.snapshot();
+        let persisted = chain.store.read().load_height().unwrap().unwrap();
+        assert_eq!(persisted.best_block, snapshot.best_block.best_block);
+        assert_eq!(persisted.depth, snapshot.best_block.depth);
+        assert_eq!(
+            persisted.validation_index,
+            snapshot.best_block.validation_index
+        );
+        assert_eq!(snapshot.best_block.depth, 10);
     }
 }
