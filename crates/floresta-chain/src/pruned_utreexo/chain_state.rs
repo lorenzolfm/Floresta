@@ -428,13 +428,20 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         ))
     }
 
-    /// Returns the acc we must validate from after reorging to `fork_point`.
-    fn reorg_acc(&self, fork_point: &BlockHeader) -> Result<Stump, BlockchainError> {
+    /// Returns the acc we must validate from after reorging, given the new `validation_index`.
+    fn reorg_acc(&self, validation_index: BlockHash) -> Result<Stump, BlockchainError> {
         let height = self
-            .get_block_height(&fork_point.block_hash())?
+            .get_block_height(&validation_index)?
             .ok_or(BlockchainError::BlockNotPresent)?;
 
-        Ok(self.get_roots_for_block(height)?.unwrap_or_default())
+        // Genesis is the only block we take as valid without ever validating it, so it's the only
+        // one that legitimately has no roots saved. Its accumulator is the empty one.
+        if height == 0 {
+            return Ok(Stump::new());
+        }
+
+        self.get_roots_for_block(height)?
+            .ok_or(BlockchainError::BadValidationIndex)
     }
 
     // This method should only be called after we validate the new branch
@@ -447,7 +454,7 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let validation_index = self.get_last_valid_block(&new_tip)?;
         let depth = self.get_chain_depth(&new_tip)?;
-        let acc = self.reorg_acc(&fork_point)?;
+        let acc = self.reorg_acc(validation_index)?;
 
         self.change_active_chain(&new_tip, validation_index, depth, acc);
 
