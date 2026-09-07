@@ -2394,6 +2394,7 @@ mod test {
         assert_eq!(fork_work, work);
         assert_eq!(work, expected_work);
     }
+
     fn connect_reorg_chains(
         chain: &ChainState<FlatChainStore>,
         short_chain: &[Block],
@@ -2468,5 +2469,54 @@ mod test {
         });
 
         assert_eq!(chain.get_validation_index().unwrap(), 16);
+    }
+
+    #[test]
+    fn reorg_above_the_validation_index_keeps_the_accumulator() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        // Take the headers all the way to the tip of the short chain, but only validate the
+        // first four blocks. The fork point, block 5, is left as `HeadersOnly`, which is the
+        // ordinary state during IBD: headers run ahead of block validation.
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+
+        let acc = chain.acc();
+        assert_ne!(acc, Stump::new(), "we validated four blocks");
+
+        // The long chain forks at block 5, above our validation index, so the reorg doesn't
+        // undo any validated block and must leave the accumulator alone.
+        for block in &long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+        assert_eq!(
+            chain.acc(),
+            acc,
+            "a reorg above the validation index must not change the accumulator",
+        );
     }
 }
