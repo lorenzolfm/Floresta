@@ -39,6 +39,15 @@ pub struct Cli {
     /// if set, log will be saved into $DATA_DIR/debug.log.
     pub log_to_file: bool,
 
+    #[arg(long, value_name = "URL")]
+    /// Export logs to an OpenTelemetry collector as OTLP/HTTP JSON
+    ///
+    /// URL is the collector's base address, e.g. http://127.0.0.1:4318; `/v1/logs` is
+    /// appended. When absent, OTEL_EXPORTER_OTLP_LOGS_ENDPOINT (full URL) and then
+    /// OTEL_EXPORTER_OTLP_ENDPOINT (base URL) are consulted. Only http:// is supported.
+    /// Set OTLP_LOG to filter this sink independently of RUST_LOG.
+    pub otlp_logs_endpoint: Option<String>,
+
     #[arg(long, value_name = "PATH")]
     /// Where should we store data. This is the directory where we'll store the chainstate,
     /// the wallet, the logs, the compact block filters, the Utreexo state, etc.
