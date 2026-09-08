@@ -2526,4 +2526,69 @@ mod test {
             "a reorg above the validation index must not change the accumulator",
         );
     }
+
+    #[test]
+    fn a_failed_reorg_leaves_the_chain_state_untouched() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        // `mark_chain_as_assumed` takes a whole range as `FullyValid` but only saves the roots
+        // for genesis, so every assumed block above our validation index has none. This is the
+        // state an assume-utreexo node runs in, and a reorg landing on one of those blocks
+        // can't find the accumulator it has to publish.
+        let acc = chain.acc();
+        chain
+            .mark_chain_as_assumed(acc.clone(), short_chain[9].block_hash())
+            .unwrap();
+
+        assert!(chain.get_roots_for_block(5).unwrap().is_none());
+
+        let best_block = chain.get_best_block().unwrap();
+        let validation_index = chain.get_validation_index().unwrap();
+        let block_after_fork = chain.get_block_hash(6).unwrap();
+
+        // The long chain forks at block 5, one of the assumed blocks, so this reorg fails when
+        // it looks for the accumulator that goes with the new validation index.
+        let error = long_chain
+            .iter()
+            .find_map(|block| chain.accept_header(block.header).err());
+
+        assert!(
+            matches!(error, Some(BlockchainError::BadValidationIndex)),
+            "expected the reorg to fail with BadValidationIndex, got {error:?}",
+        );
+
+        // A reorg that fails must not leave half of itself behind: the branches keep the state
+        // they had, and the tip, validation index and accumulator still describe the old chain.
+        assert_eq!(chain.get_best_block().unwrap(), best_block);
+        assert_eq!(
+            chain.get_validation_index().ok(),
+            Some(validation_index),
+            "the validation index must still point to a block we validated",
+        );
+        assert_eq!(chain.get_block_hash(6).unwrap(), block_after_fork);
+        assert_eq!(chain.acc(), acc);
+    }
 }
