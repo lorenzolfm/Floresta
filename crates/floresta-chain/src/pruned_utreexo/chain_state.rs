@@ -449,12 +449,12 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let current_best_block = self.get_block_header(&self.get_best_block()?.1)?;
         let fork_point = self.find_fork_point(&new_tip)?;
 
-        self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
-        self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
-
         let validation_index = self.get_last_valid_block(&new_tip)?;
         let depth = self.get_chain_depth(&new_tip)?;
         let acc = self.reorg_acc(validation_index)?;
+
+        self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
+        self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
 
         self.change_active_chain(&new_tip, validation_index, depth, acc);
 
