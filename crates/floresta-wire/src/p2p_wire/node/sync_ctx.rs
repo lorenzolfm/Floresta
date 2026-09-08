@@ -33,7 +33,22 @@ use crate::p2p_wire::peer::PeerMessages;
 ///
 /// see [node_context](crates/floresta-wire/src/p2p_wire/node_context.rs) and [node.rs](crates/floresta-wire/src/p2p_wire/node.rs) for more information.
 #[derive(Clone, Debug, Default)]
-pub struct SyncNode {}
+pub struct SyncNode {
+    /// The time of the last progress report. `None` before the first maintenance tick.
+    last_progress: Option<Instant>,
+
+    /// `true` if this node backfills the blocks that a previous run assumed valid.
+    ///
+    /// The IBD node and the backfill node download blocks at the same time, from different
+    /// ranges. The progress report must show which node sent it.
+    pub(crate) is_backfill: bool,
+}
+
+/// How often we report block download progress.
+///
+/// This interval is time-based, rather than height-based, so that we keep reporting even when
+/// throughput drops, which is exactly when a user needs to know whether we are stuck.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 impl NodeContext for SyncNode {
     /// Get the required [services](ServiceFlags) for the [`SyncNode`].
@@ -132,6 +147,28 @@ where
         }
 
         self.request_blocks(range_blocks)
+    }
+
+    fn log_progress(&mut self, height: u32, target: u32) {
+        let now = Instant::now();
+
+        // Half a tick of tolerance, otherwise timer jitter often defers us to the next tick.
+        let interval = PROGRESS_LOG_INTERVAL - SyncNode::MAINTENANCE_TICK / 2;
+
+        let too_soon = self
+            .context
+            .last_progress
+            .is_some_and(|last| now.duration_since(last) < interval);
+
+        if too_soon {
+            return;
+        }
+        self.context.last_progress = Some(now);
+
+        match self.context.is_backfill {
+            true => info!(height, target, "Backfilling blocks"),
+            false => info!(height, target, "Downloading blocks"),
+        }
     }
 
     /// This function will periodically check our connections, to ensure that:
@@ -246,6 +283,8 @@ where
             self.chain.update_ibd(IBDState::Done);
             return LoopControl::Break;
         }
+
+        self.log_progress(validation_index, best_block);
 
         periodic_job!(
             self.last_connection => self.check_connections(),
