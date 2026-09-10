@@ -2595,6 +2595,49 @@ mod test {
     }
 
     #[test]
+    fn assuming_a_chain_marks_the_blocks_we_did_not_validate() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+        let chain_blocks: Vec<Block> = blocks[0]
+            .iter()
+            .map(|s| deserialize_hex(s).unwrap())
+            .collect();
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        for block in &chain_blocks {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        let acc = Stump {
+            leaves: 42,
+            roots: vec![BitcoinNodeHash::Some([1; 32])],
+        };
+        chain
+            .mark_chain_as_assumed(acc, chain_blocks[9].block_hash())
+            .unwrap();
+
+        // The assumed block is the only one we hold an accumulator for, so it is the one block
+        // of the range that is `FullyValid`.
+        let assumed = chain.get_block_hash(10).unwrap();
+        assert!(matches!(
+            chain.get_disk_block_header(&assumed).unwrap(),
+            DiskBlockHeader::FullyValid(_, 10)
+        ));
+
+        // We never validated the blocks below it, so none of them may claim we did.
+        for height in 1..10 {
+            let hash = chain.get_block_hash(height).unwrap();
+            let header = chain.get_disk_block_header(&hash).unwrap();
+
+            assert!(
+                matches!(header, DiskBlockHeader::AssumedValid(_, _)),
+                "block {height} is assumed, not validated, but is stored as {header:?}",
+            );
+        }
+    }
+
+    #[test]
     fn an_assumed_chain_finds_its_accumulator_again_after_a_restart() {
         let json_blocks = include_str!("../../testdata/test_reorg.json");
         let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
