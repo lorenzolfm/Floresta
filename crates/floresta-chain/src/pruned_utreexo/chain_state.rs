@@ -1290,7 +1290,8 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         acc: Stump,
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
-        let mut curr_header = self.get_disk_block_header(&assumed_hash)?;
+        let assumed_header = self.get_disk_block_header(&assumed_hash)?;
+        let mut curr_header = assumed_header;
 
         while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
             if self.is_genesis(&header) {
@@ -1302,7 +1303,7 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
             curr_header = self.get_ancestor(&header)?;
         }
 
-        self.update_view(curr_header.try_height()?, &curr_header, acc.clone())?;
+        self.update_view(assumed_header.try_height()?, &assumed_header, acc.clone())?;
 
         let mut guard = write_lock!(self);
         guard.best_block.validation_index = assumed_hash;
