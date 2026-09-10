@@ -428,13 +428,20 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         ))
     }
 
-    /// Returns the acc we must validate from after reorging to `fork_point`.
-    fn reorg_acc(&self, fork_point: &BlockHeader) -> Result<Stump, BlockchainError> {
+    /// Returns the acc we must validate from after reorging, given the new `validation_index`.
+    fn reorg_acc(&self, validation_index: BlockHash) -> Result<Stump, BlockchainError> {
         let height = self
-            .get_block_height(&fork_point.block_hash())?
+            .get_block_height(&validation_index)?
             .ok_or(BlockchainError::BlockNotPresent)?;
 
-        Ok(self.get_roots_for_block(height)?.unwrap_or_default())
+        // Genesis is the only block we take as valid without ever validating it, so it's the only
+        // one that legitimately has no roots saved. Its accumulator is the empty one.
+        if height == 0 {
+            return Ok(Stump::new());
+        }
+
+        self.get_roots_for_block(height)?
+            .ok_or(BlockchainError::BadValidationIndex)
     }
 
     // This method should only be called after we validate the new branch
@@ -442,12 +449,12 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         let current_best_block = self.get_block_header(&self.get_best_block()?.1)?;
         let fork_point = self.find_fork_point(&new_tip)?;
 
-        self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
-        self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
-
         let validation_index = self.get_last_valid_block(&new_tip)?;
         let depth = self.get_chain_depth(&new_tip)?;
-        let acc = self.reorg_acc(&fork_point)?;
+        let acc = self.reorg_acc(validation_index)?;
+
+        self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
+        self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
 
         self.change_active_chain(&new_tip, validation_index, depth, acc);
 
@@ -2394,6 +2401,7 @@ mod test {
         assert_eq!(fork_work, work);
         assert_eq!(work, expected_work);
     }
+
     fn connect_reorg_chains(
         chain: &ChainState<FlatChainStore>,
         short_chain: &[Block],
@@ -2468,5 +2476,119 @@ mod test {
         });
 
         assert_eq!(chain.get_validation_index().unwrap(), 16);
+    }
+
+    #[test]
+    fn reorg_above_the_validation_index_keeps_the_accumulator() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        // Take the headers all the way to the tip of the short chain, but only validate the
+        // first four blocks. The fork point, block 5, is left as `HeadersOnly`, which is the
+        // ordinary state during IBD: headers run ahead of block validation.
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+
+        let acc = chain.acc();
+        assert_ne!(acc, Stump::new(), "we validated four blocks");
+
+        // The long chain forks at block 5, above our validation index, so the reorg doesn't
+        // undo any validated block and must leave the accumulator alone.
+        for block in &long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        assert_eq!(chain.get_validation_index().unwrap(), 4);
+        assert_eq!(
+            chain.acc(),
+            acc,
+            "a reorg above the validation index must not change the accumulator",
+        );
+    }
+
+    #[test]
+    fn a_failed_reorg_leaves_the_chain_state_untouched() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        for block in short_chain.iter().take(4) {
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+        }
+
+        // `mark_chain_as_assumed` takes a whole range as `FullyValid` but only saves the roots
+        // for genesis, so every assumed block above our validation index has none. This is the
+        // state an assume-utreexo node runs in, and a reorg landing on one of those blocks
+        // can't find the accumulator it has to publish.
+        let acc = chain.acc();
+        chain
+            .mark_chain_as_assumed(acc.clone(), short_chain[9].block_hash())
+            .unwrap();
+
+        assert!(chain.get_roots_for_block(5).unwrap().is_none());
+
+        let best_block = chain.get_best_block().unwrap();
+        let validation_index = chain.get_validation_index().unwrap();
+        let block_after_fork = chain.get_block_hash(6).unwrap();
+
+        // The long chain forks at block 5, one of the assumed blocks, so this reorg fails when
+        // it looks for the accumulator that goes with the new validation index.
+        let error = long_chain
+            .iter()
+            .find_map(|block| chain.accept_header(block.header).err());
+
+        assert!(
+            matches!(error, Some(BlockchainError::BadValidationIndex)),
+            "expected the reorg to fail with BadValidationIndex, got {error:?}",
+        );
+
+        // A reorg that fails must not leave half of itself behind: the branches keep the state
+        // they had, and the tip, validation index and accumulator still describe the old chain.
+        assert_eq!(chain.get_best_block().unwrap(), best_block);
+        assert_eq!(
+            chain.get_validation_index().ok(),
+            Some(validation_index),
+            "the validation index must still point to a block we validated",
+        );
+        assert_eq!(chain.get_block_hash(6).unwrap(), block_after_fork);
+        assert_eq!(chain.acc(), acc);
     }
 }
