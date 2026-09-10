@@ -451,12 +451,67 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
 
         let validation_index = self.get_last_valid_block(&new_tip)?;
         let depth = self.get_chain_depth(&new_tip)?;
+
+        // A reorg that lands inside the assumed range makes the assumption wrong: we hold no
+        // accumulator that goes with the new validation index, and we never validated a block
+        // below it. So we drop the assumption instead of the reorg.
+        if self.is_assumed(&validation_index)? {
+            return self.drop_assumption(&new_tip, &current_best_block, &fork_point, depth);
+        }
+
         let acc = self.reorg_acc(validation_index)?;
 
         self.mark_chain_as_inactive(&current_best_block, fork_point.block_hash())?;
         self.mark_chain_as_active(&new_tip, fork_point.block_hash())?;
 
         self.change_active_chain(&new_tip, validation_index, depth, acc);
+
+        Ok(())
+    }
+
+    /// Whether we took this block as valid without ever validating it, as `assumeutreexo` does.
+    fn is_assumed(&self, block: &BlockHash) -> Result<bool, BlockchainError> {
+        Ok(matches!(
+            self.get_disk_block_header(block)?,
+            DiskBlockHeader::AssumedValid(_, _)
+        ))
+    }
+
+    /// Gives up an `assumeutreexo` assumption that a reorg made wrong.
+    ///
+    /// The assumed accumulator describes a chain we abandoned, and no block below the assumed
+    /// one holds roots of its own. The empty accumulator at genesis is the only state left that
+    /// we can trust, so we go back to it and validate the new chain from there.
+    fn drop_assumption(
+        &self,
+        new_tip: &BlockHeader,
+        old_tip: &BlockHeader,
+        fork_point: &BlockHeader,
+        depth: u32,
+    ) -> Result<(), BlockchainError> {
+        warn!(
+            "A reorg to {} made our assumeutreexo state wrong, validating from genesis",
+            new_tip.block_hash()
+        );
+
+        self.mark_chain_as_inactive(old_tip, fork_point.block_hash())?;
+        self.mark_chain_as_active(new_tip, fork_point.block_hash())?;
+
+        // `mark_chain_as_active` takes the new branch down to the fork point. Below it both
+        // branches share the assumed blocks, and those need the same treatment.
+        let mut header = *fork_point;
+        while !self.is_genesis(&header) {
+            let height = self
+                .get_block_height(&header.block_hash())?
+                .ok_or(BlockchainError::BlockNotPresent)?;
+
+            self.update_header(&DiskBlockHeader::HeadersOnly(header, height))?;
+            header = *self.get_ancestor(&header)?;
+        }
+
+        let genesis = self.get_block_hash(0)?;
+        self.change_active_chain(new_tip, genesis, depth, Stump::new());
+        self.update_ibd(IBDState::DownloadingBlocks);
 
         Ok(())
     }
