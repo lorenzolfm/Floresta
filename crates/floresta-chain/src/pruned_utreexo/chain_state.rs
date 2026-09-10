@@ -1298,16 +1298,15 @@ impl<PersistedState: ChainStore> UpdatableChainstate for ChainState<PersistedSta
         assumed_hash: BlockHash,
     ) -> Result<bool, BlockchainError> {
         let assumed_header = self.get_disk_block_header(&assumed_hash)?;
-        let mut curr_header = assumed_header;
+        let mut curr_header = self.get_ancestor(&assumed_header)?;
 
-        while let Ok(header) = self.get_disk_block_header(&curr_header.block_hash()) {
-            if self.is_genesis(&header) {
-                break;
-            }
-
-            let height = header.try_height()?;
-            self.update_header(&DiskBlockHeader::FullyValid(*header, height))?;
-            curr_header = self.get_ancestor(&header)?;
+        // Every block below the assumed one is `AssumedValid`, not `FullyValid`: we take it as
+        // valid, but we never validated it and we hold no roots for it. That difference is what
+        // tells an invalidated assumption apart from a store that drifted.
+        while !self.is_genesis(&curr_header) {
+            let height = curr_header.try_height()?;
+            self.update_header(&DiskBlockHeader::AssumedValid(*curr_header, height))?;
+            curr_header = self.get_ancestor(&curr_header)?;
         }
 
         self.update_view(assumed_header.try_height()?, &assumed_header, acc.clone())?;
