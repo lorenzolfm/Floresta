@@ -1609,6 +1609,7 @@ mod test {
     use crate::FlatChainStoreConfig;
     use crate::extensions::WorkExt;
     use crate::prelude::HashMap;
+    use crate::pruned_utreexo::IBDState;
     use crate::pruned_utreexo::consensus::Consensus;
     use crate::pruned_utreexo::error::BlockValidationErrors;
     use crate::pruned_utreexo::utxo_data::UtxoData;
@@ -2701,5 +2702,72 @@ mod test {
             acc,
             "a restart must not throw the assumed accumulator away",
         );
+    }
+
+    #[test]
+    fn a_reorg_into_the_assumed_range_drops_the_assumption() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        // Assume the chain up to block 10, the way a node with `assumeutreexo` starts.
+        let acc = Stump {
+            leaves: 42,
+            roots: vec![BitcoinNodeHash::Some([1; 32])],
+        };
+        chain
+            .mark_chain_as_assumed(acc.clone(), short_chain[9].block_hash())
+            .unwrap();
+
+        assert_eq!(chain.get_validation_index().unwrap(), 10);
+        assert_eq!(chain.acc(), acc);
+
+        // The long chain forks at block 5, inside the assumed range. That accumulator describes
+        // a chain that is not the best one anymore, and we validated nothing below block 10, so
+        // the assumption is void.
+        for block in &long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        // We follow the new chain, but we validate it from genesis with the empty accumulator.
+        assert_eq!(
+            chain.get_best_block().unwrap().1,
+            long_chain.last().unwrap().block_hash(),
+            "the new chain has more work, so it has to win",
+        );
+        assert_eq!(chain.get_validation_index().unwrap(), 0);
+        assert_eq!(
+            chain.acc(),
+            Stump::new(),
+            "the assumed accumulator belongs to a chain we abandoned",
+        );
+        assert_eq!(chain.ibd_state(), IBDState::DownloadingBlocks);
+
+        // No block of the new chain may claim to be valid or assumed, so the node downloads and
+        // validates every one of them again.
+        for height in 1..=chain.get_best_block().unwrap().0 {
+            let hash = chain.get_block_hash(height).unwrap();
+            let header = chain.get_disk_block_header(&hash).unwrap();
+
+            assert!(
+                matches!(header, DiskBlockHeader::HeadersOnly(_, _)),
+                "block {height} has to go back to `HeadersOnly`, but is stored as {header:?}",
+            );
+        }
     }
 }
