@@ -1587,6 +1587,7 @@ mod test {
     use floresta_common::assert_ok;
     use floresta_common::bhash;
     use rand::RngExt;
+    use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::proof::Proof;
     use rustreexo::stump::Stump;
 
@@ -2469,5 +2470,72 @@ mod test {
         });
 
         assert_eq!(chain.get_validation_index().unwrap(), 16);
+    }
+    #[test]
+    fn an_assumed_chain_finds_its_accumulator_again_after_a_restart() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+        let chain_blocks: Vec<Block> = blocks[0]
+            .iter()
+            .map(|s| deserialize_hex(s).unwrap())
+            .collect();
+
+        let test_id = rand::random::<u64>();
+        let path = format!("./tmp-db/{test_id}/");
+        let config = || FlatChainStoreConfig {
+            block_index_size: Some(DEFAULT_TEST_CHAINSTORE_SIZE),
+            headers_file_size: Some(DEFAULT_TEST_CHAINSTORE_SIZE),
+            fork_file_size: Some(TEST_FORK_FILE_SIZE),
+            cache_size: Some(10),
+            file_permission: Some(0o660),
+            path: path.clone().into(),
+        };
+
+        let acc = Stump {
+            leaves: 42,
+            roots: vec![BitcoinNodeHash::Some([1; 32])],
+        };
+
+        let chain = ChainState::open(
+            FlatChainStore::new(config()).unwrap(),
+            Network::Regtest,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+
+        for block in &chain_blocks {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        let assumed_hash = chain_blocks[9].block_hash();
+        chain
+            .mark_chain_as_assumed(acc.clone(), assumed_hash)
+            .unwrap();
+
+        // The roots have to sit at the height the validation index points to, because that's
+        // where `open` looks for them.
+        let assumed_height = chain.get_validation_index().unwrap();
+        assert_eq!(assumed_height, 10);
+        assert_eq!(
+            chain.get_roots_for_block(assumed_height).unwrap(),
+            Some(acc.clone())
+        );
+
+        chain.flush().unwrap();
+        drop(chain);
+
+        let chain = ChainState::open(
+            FlatChainStore::new(config()).unwrap(),
+            Network::Regtest,
+            AssumeValidArg::Hardcoded,
+        )
+        .unwrap();
+
+        assert_eq!(chain.get_validation_index().unwrap(), assumed_height);
+        assert_eq!(
+            chain.acc(),
+            acc,
+            "a restart must not throw the assumed accumulator away",
+        );
     }
 }
