@@ -13,7 +13,11 @@ use tracing::info;
 use crate::error::FlorestadError;
 use crate::florestad::Config;
 
+/// A key we don't recognise is almost always a typo (`xpub` for `xpubs`), and silently dropping
+/// it leaves a watch-only wallet that looks healthy while watching nothing. Refuse instead: the
+/// error names the key and lists the ones we do take.
 #[derive(Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Wallet {
     pub xpubs: Option<Vec<String>>,
     pub descriptors: Option<Vec<String>>,
@@ -21,6 +25,7 @@ pub struct Wallet {
 }
 
 #[derive(Default, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     /// Wallet settings. Absent from the file means the same as an empty table: no wallet
     /// settings. An empty file is a config that asks for nothing, not a malformed one.
@@ -301,6 +306,39 @@ mod tests {
             assert!(file.wallet.descriptors.is_none());
             assert!(file.wallet.addresses.is_none());
         }
+    }
+
+    #[test]
+    fn load_fails_on_an_unknown_wallet_key() {
+        // `xpub` instead of `xpubs`. Before we denied unknown keys this parsed to an empty
+        // wallet, and the node came up watching nothing.
+        let datadir = datadir();
+        fs::write(datadir.join("config.toml"), "[wallet]\nxpub = [\"key\"]\n").unwrap();
+        let config = Config::new(Network::Bitcoin, datadir);
+
+        let loaded = load_config_file(&config);
+
+        let err = loaded.expect_err("`xpub` is not a key we take");
+        assert!(matches!(err, FlorestadError::CouldNotParseConfigFile(..)));
+        assert!(err.to_string().contains("xpub"), "{err}");
+    }
+
+    #[test]
+    fn load_fails_on_an_unknown_section() {
+        // `[wallets]` instead of `[wallet]`: the same typo one level up, and the likelier one.
+        let datadir = datadir();
+        fs::write(
+            datadir.join("config.toml"),
+            "[wallets]\nxpubs = [\"key\"]\n",
+        )
+        .unwrap();
+        let config = Config::new(Network::Bitcoin, datadir);
+
+        let loaded = load_config_file(&config);
+
+        let err = loaded.expect_err("`wallets` is not a section we take");
+        assert!(matches!(err, FlorestadError::CouldNotParseConfigFile(..)));
+        assert!(err.to_string().contains("wallets"), "{err}");
     }
 
     #[test]
