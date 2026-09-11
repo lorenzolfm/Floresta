@@ -8,7 +8,6 @@ use bitcoin::Address;
 use bitcoin::ScriptBuf;
 use serde::Deserialize;
 use tracing::debug;
-use tracing::error;
 use tracing::warn;
 
 use crate::error::FlorestadError;
@@ -115,10 +114,7 @@ impl WalletConfig {
             .map(|addr_str| {
                 Address::from_str(addr_str)
                     .map(|addr| addr.assume_checked().script_pubkey())
-                    .map_err(|e| {
-                        error!("Invalid address provided: {addr_str} \nReason: {e:?}");
-                        FlorestadError::from(e)
-                    })
+                    .map_err(|e| FlorestadError::InvalidWalletAddress(addr_str.clone(), e))
             })
             .collect::<Result<_, _>>()?;
 
@@ -213,6 +209,9 @@ mod tests {
 
         let resolved = WalletConfig::resolve(&config(Network::Bitcoin), &file, None);
 
-        assert!(matches!(resolved, Err(FlorestadError::AddressParsing(_))));
+        assert!(matches!(
+            resolved,
+            Err(FlorestadError::InvalidWalletAddress(addr, _)) if addr == "not an address"
+        ));
     }
 }

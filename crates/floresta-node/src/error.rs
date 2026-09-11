@@ -49,8 +49,9 @@ pub enum FlorestadError {
     /// Parsing registered HD version bytes from slip132.
     WalletInput(DescriptorError),
 
-    /// Parsing a bitcoin address.
-    AddressParsing(bitcoin::address::ParseError),
+    /// A wallet address from the config file that we can't parse, or that isn't valid for the
+    /// network we're running on.
+    InvalidWalletAddress(String, bitcoin::address::ParseError),
 
     /// Parsing miniscript error.
     Miniscript(miniscript::Error),
@@ -123,6 +124,22 @@ pub enum FlorestadError {
     CouldNotLoadFlatChainStore(BlockchainError),
 }
 
+/// Write `err` followed by every error in its source chain, separated by `: `.
+///
+/// Some of the errors we wrap keep their detail in [`error::Error::source`] rather than in their
+/// own `Display`, so printing only the outermost one loses the part the operator needs.
+fn write_error_chain(f: &mut Formatter<'_>, err: &dyn error::Error) -> fmt::Result {
+    write!(f, "{err}")?;
+
+    let mut source = err.source();
+    while let Some(err) = source {
+        write!(f, ": {err}")?;
+        source = err.source();
+    }
+
+    Ok(())
+}
+
 impl Display for FlorestadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -139,7 +156,12 @@ impl Display for FlorestadError {
             Self::SerdeJson(err) => write!(f, "Error serializing object {err}"),
             Self::WalletInput(err) => write!(f, "Error while parsing user input {err:?}"),
             Self::TomlParsing(err) => write!(f, "Error deserializing toml file {err}"),
-            Self::AddressParsing(err) => write!(f, "Invalid address {err}"),
+            Self::InvalidWalletAddress(addr, err) => {
+                write!(f, "Invalid wallet address {addr:?}: ")?;
+                // `address::ParseError`'s `Display` is just a category ("validation error"); the
+                // part that names the network and what was wrong lives in its source chain.
+                write_error_chain(f, err)
+            }
             Self::Miniscript(err) => write!(f, "Miniscript error: {err}"),
             Self::BlockValidation(err) => {
                 write!(f, "Error while validating block: {err:?}")
@@ -251,7 +273,6 @@ impl_from_error!(SerdeJson, serde_json::Error);
 impl_from_error!(WalletInput, DescriptorError);
 impl_from_error!(TomlParsing, toml::de::Error);
 impl_from_error!(BlockValidation, BlockValidationErrors);
-impl_from_error!(AddressParsing, bitcoin::address::ParseError);
 impl_from_error!(Miniscript, miniscript::Error);
 impl_from_error!(CouldNotObtainWalletCache, WatchOnlyError<KvDatabaseError>);
 
