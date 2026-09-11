@@ -72,7 +72,7 @@ pub struct WalletConfig {
     /// SLIP-132 extended public keys to add to the wallet. Validated by the wallet itself.
     pub xpubs: Vec<String>,
 
-    /// Addresses to watch, already parsed into their script pubkeys.
+    /// Addresses to watch, already parsed and checked against our network.
     pub addresses: Vec<ScriptBuf>,
 }
 
@@ -83,7 +83,7 @@ impl WalletConfig {
     /// documented in [`Config::config_file`]. `env_xpub` is the `WALLET_XPUB` environment
     /// variable, passed in so that this stays a pure function.
     ///
-    /// Fails if an address can't be parsed.
+    /// Fails if an address can't be parsed, or isn't valid for `config.network`.
     pub fn resolve(
         config: &Config,
         file: &ConfigFile,
@@ -113,7 +113,8 @@ impl WalletConfig {
             .flatten()
             .map(|addr_str| {
                 Address::from_str(addr_str)
-                    .map(|addr| addr.assume_checked().script_pubkey())
+                    .and_then(|addr| addr.require_network(config.network))
+                    .map(|addr| addr.script_pubkey())
                     .map_err(|e| FlorestadError::InvalidWalletAddress(addr_str.clone(), e))
             })
             .collect::<Result<_, _>>()?;
@@ -198,7 +199,8 @@ mod tests {
 
         let expected = Address::from_str(address)
             .unwrap()
-            .assume_checked()
+            .require_network(Network::Bitcoin)
+            .unwrap()
             .script_pubkey();
         assert_eq!(resolved.addresses, vec![expected]);
     }
@@ -213,5 +215,27 @@ mod tests {
             resolved,
             Err(FlorestadError::InvalidWalletAddress(addr, _)) if addr == "not an address"
         ));
+    }
+
+    #[test]
+    fn resolve_fails_on_an_address_from_another_network() {
+        // A mainnet address, given to a node running on signet
+        let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let file = config_file(None, None, Some(&[address]));
+
+        let resolved = WalletConfig::resolve(&config(Network::Signet), &file, None);
+
+        let err = resolved
+            .err()
+            .expect("a mainnet address is not valid on signet");
+        assert!(
+            matches!(err, FlorestadError::InvalidWalletAddress(ref addr, _) if addr == address)
+        );
+
+        // Refusing to boot over this is only defensible if the message says what to fix, so
+        // pin both halves of it.
+        let message = err.to_string();
+        assert!(message.contains(address), "{message}");
+        assert!(message.contains("signet"), "{message}");
     }
 }
