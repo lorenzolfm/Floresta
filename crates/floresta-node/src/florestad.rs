@@ -8,15 +8,12 @@ use core::net::SocketAddr;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(feature = "json-rpc")]
 use std::sync::OnceLock;
 
-use bitcoin::Address;
 pub use bitcoin::Network;
-use bitcoin::ScriptBuf;
 pub use floresta_chain::AssumeUtreexoValue;
 pub use floresta_chain::AssumeValidArg;
 use floresta_chain::ChainParams;
@@ -66,7 +63,8 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-use crate::config_file::ConfigFile;
+use crate::config_file::WalletConfig;
+use crate::config_file::load_config_file;
 use crate::error::FlorestadError;
 use crate::florestad::fs::OpenOptions;
 #[cfg(feature = "json-rpc")]
@@ -374,7 +372,10 @@ impl Florestad {
         Self::validate_data_dir(datadir)?;
 
         info!("Loading watch-only wallet");
-        let wallet = self.setup_wallet()?;
+        let config_file = load_config_file(&self.config)?;
+        let wallet_config =
+            WalletConfig::resolve(&self.config, &config_file, Self::get_key_from_env())?;
+        let wallet = self.setup_wallet(&wallet_config)?;
 
         // Restore the validated chainstate from persistent storage.
         // The `Arc` allows the P2P and API services to share the same chainstate.
@@ -675,39 +676,6 @@ impl Florestad {
         Ok(())
     }
 
-    /// Load config from disk; prefer explicit `config_file`, otherwise use `{data_dir}/config.toml`.
-    /// Returns default if it cannot load it
-    fn get_config_file(&self) -> ConfigFile {
-        let datadir = &self.config.datadir;
-        let config_file = self.config.config_file.as_ref();
-
-        let path = match config_file {
-            Some(path) => path.clone(),
-            None => datadir.join("config.toml"),
-        };
-
-        let data = ConfigFile::from_file(&path);
-
-        if let Ok(data) = data {
-            data
-        } else {
-            match data.unwrap_err() {
-                FlorestadError::TomlParsing(e) => {
-                    warn!("Could not parse config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
-                }
-                FlorestadError::Io(e) => {
-                    warn!("Could not read config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
-                }
-                // Shouldn't be any other error
-                _ => unreachable!(),
-            }
-        }
-    }
-
     fn get_key_from_env() -> Option<String> {
         let xpub = std::env::var("WALLET_XPUB");
         match xpub {
@@ -735,7 +703,10 @@ impl Florestad {
     }
 
     /// Setup the wallet by initializing the database and adding descriptors, xpubs, and addresses.
-    fn setup_wallet(&self) -> Result<AddressCache<KvDatabase>, FlorestadError> {
+    fn setup_wallet(
+        &self,
+        wallet_config: &WalletConfig,
+    ) -> Result<AddressCache<KvDatabase>, FlorestadError> {
         let database = KvDatabase::new(&self.config.datadir)
             .map_err(FlorestadError::CouldNotOpenKvDatabase)?;
 
@@ -746,8 +717,8 @@ impl Florestad {
             .map_err(FlorestadError::CouldNotInitializeWallet)?;
 
         // Add the configured descriptors and addresses to the wallet
-        for descriptor in self.get_descriptors() {
-            match wallet.push_descriptor(&descriptor) {
+        for descriptor in &wallet_config.descriptors {
+            match wallet.push_descriptor(descriptor) {
                 Ok(_) => info!("Added descriptor to wallet: {descriptor}"),
                 Err(WatchOnlyError::DuplicateDescriptor(_)) => {
                     warn!("Descriptor already exists in wallet, skipping: {descriptor}");
@@ -758,8 +729,8 @@ impl Florestad {
             }
         }
 
-        for xpub in self.get_xpubs() {
-            match wallet.push_xpub(&xpub, self.config.network) {
+        for xpub in &wallet_config.xpubs {
+            match wallet.push_xpub(xpub, self.config.network) {
                 Ok(()) => info!("Added xpubs to wallet: {xpub}"),
                 Err(WatchOnlyError::DuplicateDescriptor(_)) => warn!(
                     "Descriptor for the provided XPUB already exists in the wallet. Skipping: {xpub}"
@@ -768,54 +739,12 @@ impl Florestad {
             }
         }
 
-        for address in self.get_addresses()? {
-            wallet.cache_address(address);
+        for address in &wallet_config.addresses {
+            wallet.cache_address(address.clone());
         }
 
         info!("Wallet setup completed!");
         Ok(wallet)
-    }
-
-    /// Get the wallet descriptors from the config file
-    fn get_descriptors(&self) -> Vec<String> {
-        self.config
-            .wallet_descriptor
-            .iter()
-            .flatten()
-            .chain(self.get_config_file().wallet.descriptors.iter().flatten())
-            .cloned()
-            .collect()
-    }
-
-    /// Get the wallet xpubs from the config file and the environment
-    fn get_xpubs(&self) -> Vec<String> {
-        self.config
-            .wallet_xpub
-            .iter()
-            .flatten()
-            .chain(self.get_config_file().wallet.xpubs.iter().flatten())
-            .chain(Self::get_key_from_env().iter())
-            .cloned()
-            .collect()
-    }
-
-    /// Get the wallet addresses from the config file
-    fn get_addresses(&self) -> Result<Vec<ScriptBuf>, FlorestadError> {
-        self.get_config_file()
-            .wallet
-            .addresses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|addr_str| {
-                Address::from_str(addr_str)
-                    .map(|addr| addr.assume_checked().script_pubkey())
-                    .map_err(|e| {
-                        error!("Invalid address provided: {addr_str} \nReason: {e:?}");
-                        FlorestadError::from(e)
-                    })
-            })
-            .collect()
     }
 
     /// Get the default Electrum port for the Network and TLS combination.
