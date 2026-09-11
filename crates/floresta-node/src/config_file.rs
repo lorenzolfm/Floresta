@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::str::FromStr;
 
 use bitcoin::Address;
 use bitcoin::ScriptBuf;
 use serde::Deserialize;
-use tracing::debug;
-use tracing::warn;
+use tracing::info;
 
 use crate::error::FlorestadError;
 use crate::florestad::Config;
@@ -22,43 +22,55 @@ pub struct Wallet {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct ConfigFile {
+    /// Wallet settings. Absent from the file means the same as an empty table: no wallet
+    /// settings. An empty file is a config that asks for nothing, not a malformed one.
+    #[serde(default)]
     pub wallet: Wallet,
 }
 
 impl ConfigFile {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, FlorestadError> {
-        let config_file = fs::read_to_string(path.as_ref())?;
+        let path = path.as_ref();
 
-        Ok(toml::from_str(&config_file)?)
+        let config_file = fs::read_to_string(path)
+            .map_err(|e| FlorestadError::CouldNotReadConfigFile(path.to_path_buf(), e))?;
+
+        toml::from_str(&config_file)
+            .map_err(|e| FlorestadError::CouldNotParseConfigFile(path.to_path_buf(), e))
     }
 }
 
 /// Load config from disk; prefer explicit `config_file`, otherwise use `{data_dir}/config.toml`.
-/// Returns default if it cannot load it.
+///
+/// Running without a config file is supported: if we weren't given an explicit path and there is
+/// nothing at the default one, we return the defaults. Anything else is fatal — if there is a
+/// config file, or the user named one, we either honour it or refuse to start. Booting with a
+/// half-understood config would silently give the node a different wallet than the operator asked
+/// for.
 ///
 /// This should be called exactly once per boot, and the result shared with everyone that needs
-/// it. Reading it more than once may observe different file contents on each read, and repeats
-/// the warnings below.
-pub fn load_config_file(config: &Config) -> ConfigFile {
+/// it. Reading it more than once may observe different file contents on each read.
+pub fn load_config_file(config: &Config) -> Result<ConfigFile, FlorestadError> {
+    let explicit = config.config_file.is_some();
     let path = match config.config_file.as_ref() {
         Some(path) => path.clone(),
         None => config.datadir.join("config.toml"),
     };
 
     match ConfigFile::from_file(&path) {
-        Ok(data) => data,
-        Err(FlorestadError::Io(e)) => {
-            warn!("Could not read config file, ignoring it");
-            debug!("{e}");
-            ConfigFile::default()
+        Ok(file) => {
+            info!("Starting florestad with config file at {}", path.display());
+            Ok(file)
         }
-        Err(FlorestadError::TomlParsing(e)) => {
-            warn!("Could not parse config file, ignoring it");
-            debug!("{e}");
-            ConfigFile::default()
+        // Only the default path is allowed to be missing. A path we were explicitly given is an
+        // instruction, and quietly ignoring a typo in it would start a node watching nothing.
+        Err(FlorestadError::CouldNotReadConfigFile(_, e))
+            if !explicit && e.kind() == ErrorKind::NotFound =>
+        {
+            info!("Starting florestad with defaults, no config file passed");
+            Ok(ConfigFile::default())
         }
-        // Shouldn't be any other error
-        Err(_) => unreachable!(),
+        Err(e) => Err(e),
     }
 }
 
@@ -129,6 +141,10 @@ impl WalletConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use bitcoin::Network;
     use pretty_assertions::assert_eq;
 
@@ -137,6 +153,25 @@ mod tests {
     /// A [Config] with no wallet settings at all, on the given network.
     fn config(network: Network) -> Config {
         Config::new(network, "/tmp/floresta-config-tests")
+    }
+
+    /// An empty data dir of our own, so tests don't step on each other's config files.
+    ///
+    /// Removed and recreated on each call, so a previous run leaving files behind can't make a
+    /// later one pass or fail for the wrong reason.
+    fn datadir() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "floresta-config-tests-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("can create a temp data dir");
+
+        path
     }
 
     /// A [ConfigFile] with the given wallet settings, `None` meaning "key absent from the file".
@@ -237,5 +272,77 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains(address), "{message}");
         assert!(message.contains("signet"), "{message}");
+    }
+
+    #[test]
+    fn load_without_a_config_file_falls_back_to_defaults() {
+        let config = Config::new(Network::Bitcoin, datadir());
+
+        let file = load_config_file(&config).expect("a missing default config file is not fatal");
+
+        assert!(file.wallet.xpubs.is_none());
+        assert!(file.wallet.descriptors.is_none());
+        assert!(file.wallet.addresses.is_none());
+    }
+
+    #[test]
+    fn load_treats_a_config_file_without_wallet_settings_as_defaults() {
+        // An empty file, a file that is all comments, and a file with an empty `[wallet]` table
+        // are all configs that ask for no wallet, not malformed ones.
+        for contents in ["", "# nothing to see here\n", "[wallet]\n"] {
+            let datadir = datadir();
+            fs::write(datadir.join("config.toml"), contents).unwrap();
+            let config = Config::new(Network::Bitcoin, datadir);
+
+            let file = load_config_file(&config)
+                .unwrap_or_else(|e| panic!("{contents:?} should not be fatal, got: {e}"));
+
+            assert!(file.wallet.xpubs.is_none());
+            assert!(file.wallet.descriptors.is_none());
+            assert!(file.wallet.addresses.is_none());
+        }
+    }
+
+    #[test]
+    fn load_reads_the_config_file_from_the_data_dir() {
+        let datadir = datadir();
+        fs::write(
+            datadir.join("config.toml"),
+            "[wallet]\nxpubs = [\"from_file\"]\n",
+        )
+        .unwrap();
+        let config = Config::new(Network::Bitcoin, datadir);
+
+        let file = load_config_file(&config).unwrap();
+
+        assert_eq!(file.wallet.xpubs, Some(vec!["from_file".to_string()]));
+    }
+
+    #[test]
+    fn load_fails_when_an_explicitly_passed_config_file_is_missing() {
+        let datadir = datadir();
+        let mut config = Config::new(Network::Bitcoin, &datadir);
+        config.config_file = Some(datadir.join("does-not-exist.toml"));
+
+        let loaded = load_config_file(&config);
+
+        assert!(matches!(
+            loaded,
+            Err(FlorestadError::CouldNotReadConfigFile(..))
+        ));
+    }
+
+    #[test]
+    fn load_fails_on_a_malformed_config_file() {
+        let datadir = datadir();
+        fs::write(datadir.join("config.toml"), "this is not toml [[[").unwrap();
+        let config = Config::new(Network::Bitcoin, datadir);
+
+        let loaded = load_config_file(&config);
+
+        assert!(matches!(
+            loaded,
+            Err(FlorestadError::CouldNotParseConfigFile(..))
+        ));
     }
 }

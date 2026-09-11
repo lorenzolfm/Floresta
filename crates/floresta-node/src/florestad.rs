@@ -366,7 +366,7 @@ impl Florestad {
         Self::validate_data_dir(datadir)?;
 
         info!("Loading watch-only wallet");
-        let config_file = load_config_file(&self.config);
+        let config_file = load_config_file(&self.config)?;
         let wallet_config =
             WalletConfig::resolve(&self.config, &config_file, Self::get_key_from_env())?;
         let wallet = self.setup_wallet(&wallet_config)?;

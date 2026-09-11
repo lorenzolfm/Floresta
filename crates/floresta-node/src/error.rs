@@ -28,9 +28,6 @@ pub enum FlorestadError {
     /// Proof validation failure.
     Rustreexo(String),
 
-    /// Generic IO operation error.
-    Io(std::io::Error),
-
     // Block validation error, such as a missing transaction or an invalid proof.
     BlockValidation(BlockValidationErrors),
 
@@ -42,9 +39,6 @@ pub enum FlorestadError {
 
     /// Deserializing JSON error.
     SerdeJson(serde_json::Error),
-
-    /// TOML parsing error.
-    TomlParsing(toml::de::Error),
 
     /// Parsing registered HD version bytes from slip132.
     WalletInput(DescriptorError),
@@ -76,6 +70,12 @@ pub enum FlorestadError {
 
     /// Writing a file to the filesystem.
     CouldNotWriteFile(PathBuf, std::io::Error),
+
+    /// Reading the config file.
+    CouldNotReadConfigFile(PathBuf, std::io::Error),
+
+    /// Parsing the config file.
+    CouldNotParseConfigFile(PathBuf, toml::de::Error),
 
     /// Data directory doesn't exist or is not writable.
     InvalidDataDir(PathBuf),
@@ -146,7 +146,6 @@ impl Display for FlorestadError {
             Self::Encode(err) => write!(f, "Encode error: {err}"),
             Self::ParseNum(err) => write!(f, "int parse error: {err}"),
             Self::Rustreexo(err) => write!(f, "Rustreexo error: {err}"),
-            Self::Io(err) => write!(f, "Io error {err}"),
             Self::ScriptValidation(err) => {
                 write!(f, "Error during script evaluation: {err}")
             }
@@ -155,7 +154,6 @@ impl Display for FlorestadError {
             }
             Self::SerdeJson(err) => write!(f, "Error serializing object {err}"),
             Self::WalletInput(err) => write!(f, "Error while parsing user input {err:?}"),
-            Self::TomlParsing(err) => write!(f, "Error deserializing toml file {err}"),
             Self::InvalidWalletAddress(addr, err) => {
                 write!(f, "Invalid wallet address {addr:?}: ")?;
                 // `address::ParseError`'s `Display` is just a category ("validation error"); the
@@ -188,6 +186,20 @@ impl Display for FlorestadError {
                 write!(
                     f,
                     "Error while creating file at path={}: {err}",
+                    path.display()
+                )
+            }
+            Self::CouldNotReadConfigFile(path, err) => {
+                write!(
+                    f,
+                    "Could not read config file at path={}: {err}",
+                    path.display()
+                )
+            }
+            Self::CouldNotParseConfigFile(path, err) => {
+                write!(
+                    f,
+                    "Could not parse config file at path={}: {err}",
                     path.display()
                 )
             }
@@ -266,12 +278,10 @@ macro_rules! impl_from_error {
 impl_from_error!(Encode, encode::Error);
 impl_from_error!(ParseNum, core::num::ParseIntError);
 impl_from_error!(Rustreexo, String);
-impl_from_error!(Io, std::io::Error);
 impl_from_error!(ScriptValidation, bitcoin::blockdata::script::Error);
 impl_from_error!(Blockchain, BlockchainError);
 impl_from_error!(SerdeJson, serde_json::Error);
 impl_from_error!(WalletInput, DescriptorError);
-impl_from_error!(TomlParsing, toml::de::Error);
 impl_from_error!(BlockValidation, BlockValidationErrors);
 impl_from_error!(Miniscript, miniscript::Error);
 impl_from_error!(CouldNotObtainWalletCache, WatchOnlyError<KvDatabaseError>);
