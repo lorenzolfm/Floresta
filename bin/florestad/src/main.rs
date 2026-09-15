@@ -52,6 +52,17 @@ fn main() {
     // Uses a subdirectory for non-mainnet networks.
     let datadir = datadir_path(params.data_dir, params.network);
 
+    // Resolve `--config-file` against the current directory while we still have it: `--daemon`
+    // moves us to the data dir, so a relative path given on the command line would otherwise be
+    // looked up somewhere the user never meant, and reported as missing while sitting in their
+    // shell's working directory.
+    let config_file = params.config_file.map(|path| {
+        std::path::absolute(&path).unwrap_or_else(|e| {
+            eprintln!("Could not resolve config file {path:?}: {e}");
+            exit(1);
+        })
+    });
+
     // Create the data directory if it doesn't exist
     fs::create_dir_all(&datadir).unwrap_or_else(|e| {
         eprintln!("Could not create data dir {datadir:?}: {e}");
@@ -68,7 +79,7 @@ fn main() {
         assume_utreexo: !params.no_assume_utreexo,
         connect: params.connect,
         wallet_xpub: params.wallet_xpub,
-        config_file: params.config_file,
+        config_file,
         #[cfg(unix)]
         log_to_stdout: !params.daemon,
         #[cfg(not(unix))]

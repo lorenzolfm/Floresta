@@ -8,6 +8,10 @@ Wants=network-online.target
 
 
 [Service]
+# `--config-file` names a file florestad must be able to read: a path passed explicitly is an
+# instruction, and a missing or malformed one aborts startup rather than being ignored. Packagers
+# should install contrib/config.toml.sample to /etc/florestad/config.toml, or drop the flag to let
+# florestad run with its defaults.
 ExecStart=/usr/bin/florestad --daemon --data-dir=/var/lib/florestad --config-file /etc/florestad/config.toml --pid-file=/run/florestad/florestad.pid --log-to-file
 
 # Ensure that the service is ready after the MainPID exists
