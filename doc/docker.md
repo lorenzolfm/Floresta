@@ -28,6 +28,11 @@ Here's a breakdown of the configuration:
   - `-c /data/config.toml` specifies the path to the configuration file inside the container. By default, Floresta looks for a configuration file at the datadir if no configuration file is specified.
   You should mount a volume to at each path to persist data outside the container.
 
+    Make sure the host file (`/path/config/floresta.toml` above) exists before you bring the stack
+    up. Docker creates a *directory* in its place when it doesn't, and a path passed with `-c` is an
+    instruction: florestad refuses to start rather than silently running with no wallet. Drop the
+    `-c` flag if you don't want a config file.
+
   - `-n <network>` specifies the Bitcoin network to connect to (mainnet, testnet, testnet4, signet, regtest). Make sure this matches your configuration file.
 - The `ports` section maps the container's ports to your host machine. Adjust these as necessary.
   - `50001` is used for Electrum server connections. It may change depending on the network you are using or your configuration.
