@@ -20,6 +20,7 @@ mod cli;
 #[cfg(unix)]
 mod daemonize;
 mod logger;
+mod otlp;
 
 use std::env;
 use std::fs;
@@ -117,7 +118,12 @@ fn main() {
         config.log_to_file,
         config.log_to_stdout,
         log_level,
-    );
+        params.otlp_logs_endpoint.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to start logger: {e}");
+        exit(1);
+    });
 
     let _rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -164,7 +170,7 @@ fn main() {
     // drop of the runtime due to the RPC server, which panics.
     drop(florestad);
     drop(_rt);
-    // Flush logs to the file system when dropped.
+    // Flush logs to the file system and the OTLP collector when dropped.
     drop(_logger_guard);
 }
 

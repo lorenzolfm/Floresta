@@ -2,14 +2,17 @@
 
 //! Set up logging through a [`tracing`](https://docs.rs/tracing) subscriber.
 //!
-//! This module configures [`tracing_subscriber`](https://docs.rs/tracing_subscriber) with up to two output layers:
+//! This module configures [`tracing_subscriber`](https://docs.rs/tracing_subscriber) with up to three output layers:
 //! - **stdout** – human-friendly, ANSI-coloured when attached to a real TTY.
 //! - **file** – plain-text, appended to [`LOG_FILE`] inside `data_dir` via a
 //!   non-blocking writer.
+//! - **otlp** – OpenTelemetry log records posted to a collector, see [`crate::otlp`].
 //!
 //! The active log level is controlled (in descending priority) by:
 //! 1. The `RUST_LOG` environment variable.
 //! 2. The `--debug` flag (`debug` level) or its absence (`info` level).
+//!
+//! The otlp layer honours `OTLP_LOG` first, so it can be filtered on its own.
 //!
 //! When the `tokio-console` feature is enabled, the registry also enables
 //! `tokio=trace` and `runtime=trace` so that `tokio-console` can connect,
@@ -35,6 +38,10 @@ use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+
+use crate::otlp;
+use crate::otlp::OtlpGuard;
+use crate::otlp::OtlpLayer;
 
 /// The file which logging events are written to.
 pub(crate) const LOG_FILE: &str = "debug.log";
@@ -215,11 +222,20 @@ where
     }
 }
 
+/// Keeps the background log writers alive.
+///
+/// Dropping it flushes and shuts down the file writer thread and the OTLP sender
+/// thread, so it must live until the end of `main`.
+pub struct LoggerGuard {
+    _file: Option<WorkerGuard>,
+    _otlp: Option<OtlpGuard>,
+}
+
 /// Initialises the global [`tracing`] subscriber for the application.
 ///
 /// Depending on the flags provided, the subscriber can write to stdout, a log
-/// file, both, or neither. The two layers are independent and may be enabled in
-/// any combination at runtime.
+/// file, an OTLP collector, or any combination. The layers are independent and
+/// may be enabled in any combination at runtime.
 ///
 /// # Arguments
 ///
@@ -227,20 +243,20 @@ where
 ///   `log_to_file` is `true`. The directory must already exist.
 /// * `log_to_file` – Append structured log output to `<data_dir>/`[`LOG_FILE`].
 /// * `log_to_stdout` – Emit log output to stdout.
-/// * `debug` – Set the default log level to `debug`. When `false` the
-///   level defaults to `info`. In both cases `RUST_LOG` overrides the default.
+/// * `log_level` – The default log level. `RUST_LOG` overrides it.
+/// * `otlp_endpoint` – Base URL of an OTLP/HTTP collector from the command line.
+///   Resolved together with the standard `OTEL_EXPORTER_OTLP_*` variables by
+///   [`otlp::resolve_url`]; when nothing is set the OTLP layer is not installed.
 ///
 /// # Returns
 ///
-/// Returns `Ok(Some(guard))` when file logging is active. The [`WorkerGuard`]
-/// must be kept alive for the duration of the program; dropping it flushes and
-/// shuts down the non-blocking file-writer thread. Returns `Ok(None)` when file
-/// logging is disabled.
+/// Returns a [`LoggerGuard`] that must be kept alive for the duration of the
+/// program; dropping it flushes and shuts down the background writer threads.
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] if `log_to_file` is `true` and [`LOG_FILE`] cannot be
-/// created or opened for appending inside `data_dir`.
+/// Returns [`io::Error`] if the OTLP endpoint is not a plain `http://` URL or
+/// the sender thread cannot be spawned.
 ///
 /// # Panics
 ///
@@ -251,7 +267,8 @@ pub fn start_logger(
     log_to_file: bool,
     log_to_stdout: bool,
     log_level: Level,
-) -> Result<Option<WorkerGuard>, io::Error> {
+    otlp_endpoint: Option<&str>,
+) -> Result<LoggerGuard, io::Error> {
     let datadir = datadir.as_ref();
 
     let is_debug = log_level >= Level::DEBUG;
@@ -299,10 +316,27 @@ pub fn start_logger(
             .with_filter(make_filter())
     });
 
+    // Exporter for events destined to an OTLP collector.
+    let mut otlp_guard = None;
+    let otlp_layer = match otlp::resolve_url(otlp_endpoint) {
+        Some(url) => {
+            let (layer, guard) = OtlpLayer::start(url)?;
+            otlp_guard = Some(guard);
+            let filter =
+                EnvFilter::try_from_env(otlp::ENV_FILTER).unwrap_or_else(|_| make_filter());
+            Some(layer.with_filter(filter))
+        }
+        None => None,
+    };
+
     tracing_subscriber::registry()
         .with(fmt_layer_stdout)
         .with(fmt_layer_logfile)
+        .with(otlp_layer)
         .init();
 
-    Ok(guard)
+    Ok(LoggerGuard {
+        _file: guard,
+        _otlp: otlp_guard,
+    })
 }

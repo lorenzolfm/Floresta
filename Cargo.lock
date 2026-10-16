@@ -1233,11 +1233,13 @@ dependencies = [
  "floresta-common 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "floresta-node",
  "libc",
+ "serde_json",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
