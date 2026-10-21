@@ -394,11 +394,6 @@ pub enum FlatChainstoreError {
 
     /// The [`FlatChainStore`] is corrupted.
     CorruptedDatabase,
-
-    /// No height present on the validation index.
-    ///
-    /// Usually indicates a fork or invalid chain.
-    InvalidValidationIndex,
 }
 
 impl Display for FlatChainstoreError {
@@ -428,9 +423,6 @@ impl Display for FlatChainstoreError {
             ),
             Self::InvalidMetadataPointer => write!(f, "The FlatChainStore has invalid metadata"),
             Self::CorruptedDatabase => write!(f, "The FlatChainStore is corrupted"),
-            Self::InvalidValidationIndex => {
-                write!(f, "The FlatChainStore has an invalid validation index")
-            }
         }
     }
 }
@@ -1215,29 +1207,6 @@ impl ChainStore for FlatChainStore {
 
     fn save_roots_for_block(&mut self, roots: Vec<u8>, height: u32) -> Result<(), Self::Error> {
         let index = Index::new(height)?;
-
-        let metadata = unsafe { self.get_metadata()? };
-        let validation_index = self
-            .get_header(&metadata.validation_index)?
-            .map(|h| {
-                h.try_height()
-                    .map_err(|_| FlatChainstoreError::InvalidValidationIndex)
-            })
-            .transpose()?
-            .unwrap_or(0);
-
-        if height <= validation_index {
-            // this is probably a reorg, truncate the file up to the previous block height
-            let header = unsafe { self.get_disk_header(index)? };
-
-            // this is where the new acc starts, truncating the file to this position
-            let pos = header.acc_pos as u64;
-
-            self.accumulator_file
-                .set_len(pos)
-                .map_err(FlatChainstoreError::Io)?;
-        }
-
         let pos = self.accumulator_file.seek(SeekFrom::End(0))?;
         let size = roots.len();
 
