@@ -1682,6 +1682,7 @@ mod test {
     use super::ChainParams;
     use super::ChainState;
     use super::DiskBlockHeader;
+    use super::IBDState;
     use super::UpdatableChainstate;
     use crate::AssumeValidArg;
     use crate::BlockchainError;
@@ -3109,6 +3110,72 @@ mod test {
             acc,
             "a reorg above the validation index must not change the accumulator",
         );
+    }
+
+    #[test]
+    fn a_reorg_keeps_the_roots_at_and_below_the_fork_point() {
+        let json_blocks = include_str!("../../testdata/test_reorg.json");
+        let blocks: Vec<Vec<&str>> = serde_json::from_str(json_blocks).unwrap();
+
+        let parse_blocks = |blocks: &[&str]| {
+            blocks
+                .iter()
+                .map(|s| deserialize_hex(s).unwrap())
+                .collect::<Vec<Block>>()
+        };
+
+        let short_chain = parse_blocks(&blocks[0]);
+        let long_chain = parse_blocks(&blocks[1]);
+
+        // Out of IBD, `connect_block` flushes after every block, so the validation index on disk
+        // follows the tip.
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
+        chain.update_ibd(IBDState::Done);
+
+        let mut accs = vec![chain.acc()];
+        for block in &short_chain {
+            chain.accept_header(block.header).unwrap();
+            chain
+                .connect_block(block, Proof::default(), HashMap::new(), Vec::new())
+                .unwrap();
+            accs.push(chain.acc());
+        }
+
+        // The long chain forks at block 5, so the first block it connects, block 6, sits below
+        // the validation index on disk.
+        for block in &long_chain {
+            chain.accept_header(block.header).unwrap();
+        }
+
+        chain
+            .connect_block(&long_chain[0], Proof::default(), HashMap::new(), Vec::new())
+            .unwrap();
+
+        for height in 1..=5 {
+            assert_eq!(
+                chain.get_roots_for_block(height).unwrap().as_ref(),
+                Some(&accs[height as usize]),
+                "the roots of block {height} must survive the reorg",
+            );
+        }
+
+        // Extend the short chain past the long one, so we reorg back to it. The fork point is
+        // block 5 again, and its roots are the accumulator we must validate block 6 from.
+        let mut parent = short_chain[9].block_hash();
+        for height in 11..=17 {
+            let coinbase = test_coinbase(height, Sequence::MAX, LockTime::ZERO);
+            let mut block = block_with_coinbase(height, coinbase);
+            block.header.prev_blockhash = parent;
+            while block.header.validate_pow(block.header.target()).is_err() {
+                block.header.nonce += 1;
+            }
+            chain.accept_header(block.header).unwrap();
+            parent = block.block_hash();
+        }
+
+        assert_eq!(chain.get_best_block().unwrap(), (17, parent));
+        assert_eq!(chain.get_validation_index().unwrap(), 5);
+        assert_eq!(chain.acc(), accs[5]);
     }
 
     #[test]
