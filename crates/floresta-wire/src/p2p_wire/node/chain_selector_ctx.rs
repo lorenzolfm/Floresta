@@ -89,6 +89,10 @@ use crate::node_context::PeerId;
 use crate::p2p_wire::error::WireError;
 use crate::p2p_wire::peer::PeerMessages;
 
+/// The most headers a peer sends in one `headers` message. If it sends fewer, it has nothing
+/// after the last one.
+const MAX_HEADERS_RESULTS: usize = 2_000;
+
 #[derive(Debug, Default, Clone)]
 /// A p2p driver that attempts to connect with multiple peers, ask which chain are them following
 /// and download and verify the headers, **not** the actual blocks. This is the first part of a
@@ -156,9 +160,10 @@ where
 {
     /// This function is called every time we get a `Headers` message from a peer.
     /// It will validate the headers and add them to our chain, if they are valid.
-    /// If we get an empty headers message, we'll check what to do next, depending on
-    /// our current state. We may poke our peers to see if they have an alternative tip,
-    /// or we may just finish the IBD, if no one have an alternative tip.
+    /// If we get fewer than a full batch, this peer has no more headers, so we'll check
+    /// what to do next, depending on our current state. We may poke our peers to see if
+    /// they have an alternative tip, or we may just finish the IBD, if no one have an
+    /// alternative tip.
     async fn handle_headers(
         &mut self,
         peer: PeerId,
@@ -197,6 +202,13 @@ where
             .or_insert(last);
 
         self.last_tip_update = Instant::now();
+
+        // Peers also announce new blocks with a `headers` message. Asking for more after each
+        // announcement would start another `getheaders` round trip for every new block.
+        if headers.len() < MAX_HEADERS_RESULTS {
+            return self.empty_headers_message(peer).await;
+        }
+
         self.request_headers(last)
     }
 
@@ -617,8 +629,8 @@ where
         Self::parse_acc(&candidate_accs.pop().unwrap().1)
     }
 
-    /// If we get an empty `headers` message, our next action depends on which state are
-    /// we in:
+    /// If we get an empty or short `headers` message, our next action depends on which
+    /// state are we in:
     ///   - If we are downloading headers for the first time, this means we've just
     ///     finished and should go to the next phase
     ///   - If we are checking with our peer if they have an alternative tip, this peer
@@ -1076,9 +1088,15 @@ mod tests {
 
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
+    use floresta_chain::pruned_utreexo::BlockchainInterface;
     use rustreexo::node_hash::BitcoinNodeHash;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
+    use crate::p2p_wire::tests::utils::PeerData;
+    use crate::p2p_wire::tests::utils::SetupNodeArgs;
+    use crate::p2p_wire::tests::utils::setup_node;
+    use crate::p2p_wire::tests::utils::signet_headers;
 
     type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, ChainSelector>;
 
@@ -1090,6 +1108,54 @@ mod tests {
         let mut acc = leaves.to_le_bytes().to_vec();
         acc.extend(std::iter::repeat_n(0u8, 32 * root_count));
         acc
+    }
+
+    async fn receive_headers(node: &mut TestNode, headers: &[Header]) {
+        let msg = PeerMessages::Headers(headers.to_vec());
+        let notification = NodeNotification::FromPeer(0, msg, Instant::now());
+        node.handle_notification(notification).await.unwrap();
+    }
+
+    #[tokio::test]
+    // A peer that prefers headers announces each new block in its own `headers` message. If we
+    // ask for more after every one of them, a peer mining quickly gets one `getheaders` round
+    // trip per block, and soon looks like a spammer to us.
+    async fn test_short_headers_batch_ends_download() {
+        let headers = signet_headers();
+        let peer = PeerData::new(Vec::new(), HashMap::new(), HashMap::new());
+        let datadir = format!("./tmp-db/{}.chain_selector", rand::random::<u32>());
+        let args = SetupNodeArgs::new(vec![peer], false, Network::Signet, datadir, 0);
+        let mut node = setup_node::<ChainSelector>(args);
+
+        // Finish the handshake with our only peer, then capture what we send it
+        let ready = node.node_rx.recv().await.unwrap();
+        node.handle_notification(ready).await.unwrap();
+        let (sender, mut requests) = unbounded_channel();
+        node.peers.get_mut(&0).unwrap().channel = sender;
+        node.context.state = ChainSelectorState::DownloadingHeaders;
+
+        // A full batch may stop short of the peer's tip, so we ask for the next one
+        receive_headers(&mut node, &headers[1..=MAX_HEADERS_RESULTS]).await;
+        let Ok(NodeRequest::GetHeaders(locator)) = requests.try_recv() else {
+            panic!("a full batch should be followed by a getheaders");
+        };
+        assert_eq!(locator[0], headers[MAX_HEADERS_RESULTS].block_hash());
+
+        // The peer then announces its next blocks, one header per message
+        for header in &headers[MAX_HEADERS_RESULTS + 1..] {
+            receive_headers(&mut node, std::slice::from_ref(header)).await;
+        }
+
+        // Only the first announcement gets a `getheaders`: asking our peers if they agree
+        let get_headers = std::iter::from_fn(|| requests.try_recv().ok())
+            .filter(|req| matches!(req, NodeRequest::GetHeaders(_)))
+            .count();
+        assert_eq!(get_headers, 1);
+        assert_eq!(node.context.state, ChainSelectorState::Done);
+        assert_eq!(
+            node.chain.get_best_block().unwrap().1,
+            headers.last().unwrap().block_hash()
+        );
     }
 
     #[test]
