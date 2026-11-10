@@ -904,7 +904,7 @@ where
             .map(|peer| peer.address.clone())
             .collect();
         if utreexo_peers.is_empty() {
-            warn!("No connected Utreexo peers to save to disk");
+            debug!("No connected Utreexo peers to save to disk");
             return Ok(());
         }
         info!("Saving utreexo peers to disk...");
