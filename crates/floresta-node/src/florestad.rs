@@ -694,13 +694,24 @@ impl Florestad {
         } else {
             match data.unwrap_err() {
                 FlorestadError::TomlParsing(e) => {
-                    warn!("Could not parse config file, ignoring it");
-                    debug!("{e}");
+                    warn!(
+                        "Could not parse config file {}, ignoring it: {e}",
+                        path.display()
+                    );
+                    ConfigFile::default()
+                }
+                // No file at the default path is the common case, not a problem
+                FlorestadError::Io(e)
+                    if config_file.is_none() && e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    debug!("No config file at {}, using defaults", path.display());
                     ConfigFile::default()
                 }
                 FlorestadError::Io(e) => {
-                    warn!("Could not read config file, ignoring it");
-                    debug!("{e}");
+                    warn!(
+                        "Could not read config file {}, ignoring it: {e}",
+                        path.display()
+                    );
                     ConfigFile::default()
                 }
                 // Shouldn't be any other error
