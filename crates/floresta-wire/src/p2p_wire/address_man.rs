@@ -883,11 +883,18 @@ impl AddressMan {
                 .collect::<Vec<_>>())
         });
 
-        if anchors.is_err() {
-            warn!("Failed to init Utreexo peers: anchors.json does not exist yet, or is invalid");
+        match anchors {
+            Ok(anchors) => anchors,
+            // No utreexo peer was saved yet, e.g. on a fresh start
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!("No anchors.json yet, no Utreexo peers to reconnect to");
+                Vec::new()
+            }
+            Err(e) => {
+                warn!("Failed to init Utreexo peers from anchors.json: {e}");
+                Vec::new()
+            }
         }
-
-        anchors.unwrap_or_default()
     }
 
     /// This function moves addresses between buckets, like if the ban time of a peer expired,
