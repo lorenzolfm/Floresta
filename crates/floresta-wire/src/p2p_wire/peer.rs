@@ -690,7 +690,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.handle_version(version).await?;
                 }
                 _ => {
-                    warn!("unexpected message: {:?} from peer {}", message, self.id);
+                    debug!(
+                        "unexpected message: {} from peer {}",
+                        message.command(),
+                        self.id
+                    );
                     return Err(PeerError::UnexpectedMessage);
                 }
             },
@@ -720,7 +724,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 }
                 bitcoin::p2p::message::NetworkMessage::WtxidRelay => {}
                 _ => {
-                    warn!("unexpected message: {:?} from peer {}", message, self.id);
+                    debug!(
+                        "unexpected message: {} from peer {}",
+                        message.command(),
+                        self.id
+                    );
                     return Err(PeerError::UnexpectedMessage);
                 }
             },

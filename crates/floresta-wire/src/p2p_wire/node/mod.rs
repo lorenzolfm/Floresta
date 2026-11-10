@@ -46,6 +46,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
+use tracing::debug;
 use tracing::info;
 
 use super::UtreexoNodeConfig;
@@ -481,7 +482,10 @@ where
         info!("Shutting down node...");
         try_and_warn!(self.save_utreexo_peers());
         for peer in self.peer_ids.iter() {
-            try_and_log!(self.send_to_peer(*peer, NodeRequest::Shutdown));
+            // The peer may already be gone, which is fine since we're shutting down anyway
+            if let Err(e) = self.send_to_peer(*peer, NodeRequest::Shutdown) {
+                debug!("Could not send shutdown to peer {peer}: {e:?}");
+            }
         }
         try_and_log!(self.save_peers());
         try_and_log!(self.chain.flush());

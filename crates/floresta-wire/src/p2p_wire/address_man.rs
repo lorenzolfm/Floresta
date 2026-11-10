@@ -28,7 +28,6 @@ use rand::seq::IteratorRandom;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -649,26 +648,29 @@ impl AddressMan {
             Some(proxy) => {
                 debug!("Performing DNS lookup for host: {host}, using SOCKS5 proxy: {proxy}");
                 // SOCKS5 proxy lookup (proxied DNS-over-HTTPS).
-                dns_proxy::lookup_host_via_proxy(host, proxy).unwrap_or_else(|e| {
-                    error!("DNS lookup via SOCKS5 proxy failed: {e}");
-                    Vec::new()
-                })
+                dns_proxy::lookup_host_via_proxy(host, proxy).map_err(|e| e.to_string())
             }
             None => {
                 debug!("Performing DNS lookup for host: {host}, using the system resolver");
                 // System lookup (usually unencrypted, resolver sees both query and our IP).
-                dns_lookup::lookup_host(host).unwrap_or_else(|e| {
-                    error!("DNS lookup failed: {e}");
-                    Vec::new()
-                })
+                dns_lookup::lookup_host(host).map_err(|e| e.to_string())
             }
         };
 
-        if ips.is_empty() {
-            warn!("No peer addresses read from DNS host: {host}");
-        } else {
-            info!("Fetched {} peer addresses from DNS host: {host}", ips.len());
-        }
+        let ips = match ips {
+            Ok(ips) if ips.is_empty() => {
+                warn!("No peer addresses read from DNS host: {host}");
+                ips
+            }
+            Ok(ips) => {
+                info!("Fetched {} peer addresses from DNS host: {host}", ips.len());
+                ips
+            }
+            Err(e) => {
+                warn!("DNS lookup failed for host {host}: {e}");
+                Vec::new()
+            }
+        };
 
         let mut addresses = Vec::new();
         for ip in ips {
@@ -883,11 +885,18 @@ impl AddressMan {
                 .collect::<Vec<_>>())
         });
 
-        if anchors.is_err() {
-            warn!("Failed to init Utreexo peers: anchors.json does not exist yet, or is invalid");
+        match anchors {
+            Ok(anchors) => anchors,
+            // No utreexo peer was saved yet, e.g. on a fresh start
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!("No anchors.json yet, no Utreexo peers to reconnect to");
+                Vec::new()
+            }
+            Err(e) => {
+                warn!("Failed to init Utreexo peers from anchors.json: {e}");
+                Vec::new()
+            }
         }
-
-        anchors.unwrap_or_default()
     }
 
     /// This function moves addresses between buckets, like if the ban time of a peer expired,
