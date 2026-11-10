@@ -87,7 +87,11 @@ where
             self.last_block_request += 1;
         }
 
-        try_and_log!(self.request_blocks(blocks));
+        match self.request_blocks(blocks) {
+            // Transient, e.g. right after startup or the assume-utreexo jump
+            Err(WireError::NoPeersAvailable) => debug!("No peer to request blocks from yet"),
+            result => try_and_log!(result),
+        }
     }
 
     fn ask_for_missed_blocks(&mut self) -> Result<(), WireError> {
@@ -252,7 +256,10 @@ where
         }
 
         // Ask for missed blocks or proofs if they are no longer inflight or pending
-        try_and_log!(self.ask_for_missed_blocks());
+        match self.ask_for_missed_blocks() {
+            Err(WireError::NoPeersAvailable) => debug!("No peer to request missed blocks from yet"),
+            result => try_and_log!(result),
+        }
         try_and_log!(self.ask_for_missed_proofs());
 
         self.get_blocks_to_download();
